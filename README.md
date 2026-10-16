@@ -1,14 +1,14 @@
 # rivervo
 
 Rivervo Applications from the command line: deploy, follow a build, read logs, manage
-variables, roll back. One file, no dependencies, Node.js 22 or newer.
+variables, roll back, open a shell in a running service. One file, no dependencies, Node.js 22 or newer.
 
 ## Install
 
 ```sh
 npm install -g rivervo          # once the package is published
 # or straight from a checkout / a packed file:
-npm install -g ./rivervo-1.0.0.tgz
+npm install -g ./rivervo-1.1.0.tgz
 ```
 
 ## Sign in
@@ -19,7 +19,7 @@ Create a token in the panel: **Account settings → API tokens**. Choose what it
 |----------|--------|
 | `read`   | apps, deployments and their logs, runtime logs, domains |
 | `deploy` | read + deploy, redeploy, roll back, restart |
-| `full`   | deploy + variables (read and change) and domains |
+| `full`   | deploy + variables (read and change), domains and `rivervo shell` |
 
 The token is shown once. Then:
 
@@ -48,7 +48,15 @@ rivervo env rm shop DEBUG
 rivervo rollback shop                     # back to the previous version
 rivervo rollback shop 1234                # back to deployment 1234
 rivervo open shop                         # open it in the browser
+rivervo shell shop                        # an interactive shell in the running app (tinker, psql, Tab, arrows)
+rivervo shell shop --process w1           # … in its first background worker (i2: its second instance)
+echo 'php artisan about' | rivervo shell shop   # input from a pipe: the shell ends with it
 ```
+
+`rivervo shell` connects straight to the app's own address (`wss://<slug>.rivervo.app`) with a one-time ticket
+from the API; your terminal is raw while it lasts, and the command exits with the shell's exit code. It closes
+after 30 minutes without activity and after 4 hours at most; at most 2 can be open to a service at once.
+Opening one is noted in the account's activity; what you type is not recorded. Needs a `full` token.
 
 `[app]` is an app's id, address (`shop` in `shop.rivervo.app`) or name, or the id of a service
 (a worker, a database). Leave it out when you have one app, or set `--app` / `RIVERVO_APP`.

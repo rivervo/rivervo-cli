@@ -4,7 +4,7 @@
  * One file, no dependencies (Node 22+): it talks to the public API (/api/v1) with a
  * personal API token from Account settings → API tokens.
  *
- *   rivervo login | logout | apps | deploy | logs | env ls|set|rm | rollback | open
+ *   rivervo login | logout | apps | deploy | logs | env ls|set|rm | rollback | open | shell
  *
  * Importable for tests: main(argv, io) runs one command and resolves its exit code.
  */
@@ -16,7 +16,7 @@ import { pathToFileURL } from 'node:url'
 import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
 
-export const VERSION = '1.0.0'
+export const VERSION = '1.1.0'
 const DEFAULT_API = 'https://api.rivervo.com/api/v1'
 
 const HELP = `rivervo ${VERSION} — Rivervo Applications from the command line
@@ -34,6 +34,8 @@ Usage
   rivervo env rm [app] KEY …
   rivervo rollback [app] [deployment]             back to an earlier version (default: the previous one)
   rivervo open [app]                              open the app in the browser
+  rivervo shell [app] [--process web|i2|w1]       an interactive shell in the running service (tinker, psql…);
+                                                  web is its first instance, i2… the others, w1… a worker
 
 [app] is an app's id, address (slug) or name — or a service's id. Without it: --app, the
 RIVERVO_APP variable, or your only app.
@@ -370,7 +372,99 @@ async function cmdOpen (ctx) {
   return 0
 }
 
-const COMMANDS = { login: cmdLogin, logout: cmdLogout, apps: cmdApps, ls: cmdApps, deploy: cmdDeploy, rollback: cmdRollback, logs: cmdLogs, env: cmdEnv, open: cmdOpen }
+// ── shell ────────────────────────────────────────────────────────────────
+
+const SHELL_ERRORS = {
+  limit: 'Too many terminals are open to this service at once. Close one and try again.',
+  not_running: 'This process is not running right now.',
+  no_shell: 'This service has no shell to open.',
+  busy: 'The terminal is busy right now. Try again in a minute.',
+}
+
+/**
+ * An interactive shell: a one-time ticket from the API, then a WebSocket straight to the app's own
+ * address (the server's terminal gateway). The terminal is raw while it lasts; the exit code is the shell's.
+ * io.WebSocket / io.stdin / io.stdout can be given (tests); Node 22 has WebSocket built in.
+ */
+async function cmdShell (ctx) {
+  const { call, opt, pos, io } = ctx
+  const WS = 'WebSocket' in io ? io.WebSocket : globalThis.WebSocket
+  if (!WS) { io.err('rivervo shell needs Node.js 22 or newer.\n'); return 1 }
+  const app = await resolveApp(call, pos[0] ?? ctx.appRef)
+  const proc = opt.process ?? 'web'
+  const { data: t } = await call('POST', `/apps/${app.id}/terminal`, { body: { process: proc } })
+  const stdin = io.stdin ?? process.stdin
+  const stdout = io.stdout ?? process.stdout
+  const size = () => ({ cols: stdout.columns || 80, rows: stdout.rows || 24 })
+
+  return new Promise((resolve) => {
+    const ws = new WS(t.url)
+    ws.binaryType = 'arraybuffer'
+    let raw = false
+    let ready = false
+    let told = false
+    let code = 0
+    let exited = false
+    let limits = {}
+    const open = () => ws.readyState === 1
+    const onInput = (chunk) => { if (open()) ws.send(typeof chunk === 'string' ? new TextEncoder().encode(chunk) : chunk) }
+    // Input from a pipe: its end ends the shell (Ctrl+D), so `echo cmd | rivervo shell` returns.
+    const onEnd = () => { if (open()) ws.send(new Uint8Array([4])) }
+    const onResize = () => { if (open()) ws.send(JSON.stringify({ type: 'resize', ...size() })) }
+    const say = (text) => { told = true; io.err(`${raw ? '\r\n' : ''}${text}\n`) }
+    const restore = () => {
+      stdin.off?.('data', onInput)
+      stdin.off?.('end', onEnd)
+      stdout.off?.('resize', onResize)
+      if (raw && stdin.setRawMode) stdin.setRawMode(false)
+      raw = false
+      stdin.pause?.()
+    }
+    ws.onopen = () => ws.send(JSON.stringify({ type: 'auth', ticket: t.ticket, ...size() }))
+    ws.onmessage = (ev) => {
+      if (typeof ev.data !== 'string') { stdout.write(Buffer.from(ev.data)); return }
+      let m
+      try { m = JSON.parse(ev.data) } catch { return }
+      if (m.type === 'ready') {
+        ready = true
+        limits = m
+        io.err(`Connected to ${app.name} (${proc}). Leave with exit or Ctrl+D.\n`)
+        if (stdin.isTTY && stdin.setRawMode) { stdin.setRawMode(true); raw = true }
+        stdin.on('data', onInput)
+        stdin.on('end', onEnd)
+        stdin.resume?.()
+        stdout.on?.('resize', onResize)
+      } else if (m.type === 'exit') {
+        exited = true
+        code = Number.isInteger(m.code) ? m.code : 0
+      } else if (m.type === 'closing') {
+        code = 1
+        if (m.reason === 'idle') say(`Closed after ${Math.round((limits.idle ?? 1800) / 60)} minutes without activity.`)
+        else if (m.reason === 'max') say(`Closed: a session lasts at most ${Math.round((limits.max ?? 14400) / 3600)} hours.`)
+        else say('The session ended for maintenance. Connect again.')
+      } else if (m.type === 'error') {
+        code = 1
+        say(SHELL_ERRORS[m.code] ?? 'The session could not start. Try again or write to support.')
+      }
+    }
+    let done = false
+    const finish = () => {
+      if (done) return
+      done = true
+      clearTimeout(timer)
+      restore()
+      if (!told && !ready) { code = 1; io.err('The connection could not be established. Check your network and try again.\n') }
+      else if (!told && !exited) { code = 1; io.err('The connection was lost.\n') }
+      resolve(code)
+    }
+    // Node's client reports a refused connection as an error without a close; nor may a silent network ever answer.
+    const timer = setTimeout(() => { if (!ready) { try { ws.close() } catch {} finish() } }, 20000)
+    ws.onerror = () => { if (!ready) finish() }
+    ws.onclose = finish
+  })
+}
+
+const COMMANDS = { shell: cmdShell, login: cmdLogin, logout: cmdLogout, apps: cmdApps, ls: cmdApps, deploy: cmdDeploy, rollback: cmdRollback, logs: cmdLogs, env: cmdEnv, open: cmdOpen }
 
 /** Run one command. @returns {Promise<number>} the exit code */
 export async function main (argv = process.argv.slice(2), io = {}) {
