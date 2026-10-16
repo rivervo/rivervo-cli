@@ -17,7 +17,11 @@
   "scripts": {
     "test": "node --test test/*.test.mjs"
   },
-  "keywords": ["rivervo", "deploy", "cli", "hosting"],
-  "license": "UNLICENSED",
-  "private": true
+  "keywords": [
+    "rivervo",
+    "deploy",
+    "cli",
+    "hosting"
+  ],
+  "license": "UNLICENSED"
 }

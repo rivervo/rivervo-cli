@@ -6,7 +6,7 @@ variables, roll back, open a shell in a running service. One file, no dependenci
 ## Install
 
 ```sh
-npm install -g rivervo          # once the package is published
+npm install -g rivervo
 # or straight from a checkout / a packed file:
 npm install -g ./rivervo-1.1.0.tgz
 ```
