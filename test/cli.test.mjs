@@ -5,7 +5,7 @@ import { createServer } from 'node:http'
 import { mkdtemp, readFile, stat, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { main, parseArgs, configDir } from '../bin/rivervo.mjs'
+import { main, parseArgs, configDir, afterOverlap } from '../bin/rivervo.mjs'
 
 let server
 let base
@@ -198,6 +198,13 @@ test('logs: the tail, then --follow asks only for lines after the last one shown
   assert.equal(logs[0].get('process'), 'w1')
   assert.equal(logs[1].get('since'), '2026-10-16T10:00:05.000000000Z')
   assert.equal(logs[2].get('since'), '2026-10-16T10:00:09.000000000Z')
+})
+
+test('a log without times (the schedule) shows only lines after the ones already shown', () => {
+  assert.deepEqual(afterOverlap(['a', 'b', 'c'], ['a', 'b', 'c', 'd', 'e']), ['d', 'e'])
+  assert.deepEqual(afterOverlap(['x', 'b', 'c'], ['b', 'c', 'd']), ['b', 'c', 'd'])  // the anchor is gone: everything
+  assert.deepEqual(afterOverlap(['b', 'c', 'b', 'c'], ['c', 'b', 'c', 'z']), ['z'])
+  assert.deepEqual(afterOverlap([], ['a']), ['a'])
 })
 
 test('env ls hides values unless --reveal; set and rm patch only what is named', async () => {

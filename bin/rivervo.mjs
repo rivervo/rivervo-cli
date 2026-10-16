@@ -286,21 +286,36 @@ async function cmdLogs (ctx) {
   if (!opt.follow) return 0
   const every = Number(env.RIVERVO_POLL_MS ?? 2000)
   const until = env.RIVERVO_FOLLOW_ROUNDS ? Number(env.RIVERVO_FOLLOW_ROUNDS) : Infinity
-  // Follow from the last line we printed (lines carry their time), else from the server's clock.
+  // Follow from the last line we printed: web and workers stamp each line with its time (the server
+  // sends only later ones); the schedule's log has no times, so new lines are found after the last ones shown.
   const stamp = l => /^(\d{4}-\d\d-\d\dT[\d:.]+Z)\s/.exec(l)?.[1]
+  const stamped = process_ !== 'cron'
   let since = stamp(res.data.lines.at(-1) ?? '') ?? res.at
+  let shown = res.data.lines
   for (let round = 0; round < until; round++) {
     await sleep(every)
     try {
-      res = await call('GET', `/apps/${app.id}/logs`, { query: { lines: 500, process: process_, since } })
+      res = await call('GET', `/apps/${app.id}/logs`, { query: { lines: 500, process: process_, since: stamped ? since : undefined } })
     } catch (e) {
       if (e.status === 429) continue
       throw e
     }
-    for (const l of res.data.lines) io.out(l + '\n')
-    since = stamp(res.data.lines.at(-1) ?? '') ?? since
+    const fresh = stamped ? res.data.lines : afterOverlap(shown, res.data.lines)
+    for (const l of fresh) io.out(l + '\n')
+    if (stamped) since = stamp(fresh.at(-1) ?? '') ?? since
+    else shown = res.data.lines
   }
   return 0
+}
+
+/** The lines of `next` after the last lines of `prev` (a log without times, read again from its end). */
+export function afterOverlap (prev, next) {
+  const anchor = prev.slice(-3)
+  if (!anchor.length) return next
+  for (let i = next.length - anchor.length; i >= 0; i--) {
+    if (anchor.every((l, k) => next[i + k] === l)) return next.slice(i + anchor.length)
+  }
+  return next
 }
 
 async function cmdEnv (ctx) {
