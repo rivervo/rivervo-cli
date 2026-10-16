@@ -1,0 +1,23 @@
+{
+  "name": "rivervo",
+  "version": "1.0.0",
+  "description": "Rivervo Applications from the command line: deploy, logs, variables, rollbacks.",
+  "type": "module",
+  "bin": {
+    "rivervo": "bin/rivervo.mjs"
+  },
+  "files": [
+    "bin/rivervo.mjs",
+    "README.md"
+  ],
+  "exports": "./bin/rivervo.mjs",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "keywords": ["rivervo", "deploy", "cli", "hosting"],
+  "license": "UNLICENSED",
+  "private": true
+}
