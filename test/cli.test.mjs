@@ -95,6 +95,7 @@ async function run (argv, { env = {}, prompt } = {}) {
     out: s => { out += s },
     err: s => { err += s },
     prompt,
+    cwd: home,
     env: { XDG_CONFIG_HOME: home, RIVERVO_POLL_MS: '1', RIVERVO_NO_BROWSER: '1', RIVERVO_API_URL: `${base}/api/v1`, RIVERVO_TOKEN: 'good-token', ...env },
   })
   return { code, out, err }
@@ -109,7 +110,7 @@ test('parses flags, short flags and values', () => {
 test('login: verifies the pasted token and stores it privately; logout forgets it', async () => {
   const r = await run(['login', '--api', `${base}/api/v1`], { env: { RIVERVO_TOKEN: '', RIVERVO_API_URL: '' }, prompt: async () => ' good-token \n' })
   assert.equal(r.code, 0, r.err)
-  assert.match(r.out, /Logged in\. 2 apps visible/)
+  assert.match(r.out, /Logged in\. 2 applications visible/)
   const file = join(configDir({ XDG_CONFIG_HOME: home }), 'config.json')
   assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), { api: `${base}/api/v1`, token: 'good-token' })
   assert.equal((await stat(file)).mode & 0o777, 0o600)
@@ -133,7 +134,7 @@ test('login refuses a bad token and stores nothing', async () => {
   await assert.rejects(readFile(join(configDir({ XDG_CONFIG_HOME: home }), 'config.json')))
 })
 
-test('apps: a table of apps with their services', async () => {
+test('apps: an API before applications (no /apps/projects): the table of apps with their services', async () => {
   const r = await run(['apps'])
   assert.equal(r.code, 0)
   assert.match(r.out, /^ID\s+NAME\s+STATUS\s+URL/)

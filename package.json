@@ -1,7 +1,7 @@
 {
   "name": "rivervo",
-  "version": "1.1.0",
-  "description": "Rivervo Applications from the command line: deploy, logs, variables, rollbacks.",
+  "version": "1.2.0",
+  "description": "Rivervo Applications from the command line: deploy, logs, variables, rollbacks, usage.",
   "type": "module",
   "bin": {
     "rivervo": "bin/rivervo.mjs"
