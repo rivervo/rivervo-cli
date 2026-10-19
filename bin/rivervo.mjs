@@ -17,7 +17,7 @@ import { pathToFileURL } from 'node:url'
 import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
 
-export const VERSION = '1.3.1'
+export const VERSION = '1.3.2'
 const DEFAULT_API = 'https://api.rivervo.com/api/v1'
 
 const HELP = `rivervo ${VERSION} — Rivervo Applications from the command line

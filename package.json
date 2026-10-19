@@ -1,6 +1,6 @@
 {
   "name": "rivervo",
-  "version": "1.3.1",
+  "version": "1.3.2",
   "description": "Rivervo Applications from the command line: deploy, logs, variables, rollbacks, usage.",
   "type": "module",
   "bin": {
@@ -23,5 +23,13 @@
     "cli",
     "hosting"
   ],
-  "license": "UNLICENSED"
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aegis-mail/rivervo-cli.git"
+  },
+  "homepage": "https://rivervo.com/help/applications/developer-tools",
+  "bugs": {
+    "url": "https://github.com/aegis-mail/rivervo-cli/issues"
+  }
 }
