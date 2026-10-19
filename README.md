@@ -8,7 +8,7 @@ variables, roll back, open a shell in a running service. One file, no dependenci
 ```sh
 npm install -g rivervo
 # or straight from a checkout / a packed file:
-npm install -g ./rivervo-1.2.0.tgz
+npm install -g ./rivervo-1.3.0.tgz
 ```
 
 ## Sign in
@@ -19,7 +19,7 @@ Create a token in the panel: **Account settings → API tokens**. Choose what it
 |----------|--------|
 | `read`   | applications, deployments and their logs, runtime logs, domains, usage (if your role sees money) |
 | `deploy` | read + deploy, redeploy, roll back, restart |
-| `full`   | deploy + variables (a service's own and the application's shared ones), domains and `rivervo shell` |
+| `full`   | deploy + variables (a service's own and the application's shared ones), domains, a public address on or off and `rivervo shell` |
 
 The token is shown once. Then:
 
@@ -44,7 +44,10 @@ An application's name alone (`shop`) means its only code service; when it has se
 ## Use
 
 ```sh
-rivervo apps                              # your applications and their services
+rivervo apps                              # your applications and their services (rivervo services: the same)
+rivervo services info shop/api            # a service: status, public and internal address, repository, resources
+rivervo services set-public shop/api off  # internal only: no public address (asks first; --yes / -y does not)
+rivervo services set-public shop/api on   # a public address again (on|off, true|false, public|internal)
 rivervo link shop/web                     # this directory works with shop/web (saved in .rivervo)
 rivervo deploy shop                       # build the latest commit and follow the deploy
 rivervo deploy shop --no-build            # deploy the running version again (applies changed variables)
@@ -61,7 +64,7 @@ rivervo usage shop                        # spent this month, forecast, next pay
 rivervo usage shop --month 2026-09
 rivervo rollback shop                     # back to the previous version
 rivervo rollback shop 1234                # back to deployment 1234
-rivervo open shop                         # open it in the browser
+rivervo open shop                         # open it in the browser (an internal-only service has no address to open)
 rivervo shell shop                        # an interactive shell in the running app (tinker, psql, Tab, arrows)
 rivervo shell shop --process w1           # … in its first background worker (i2: its second instance)
 echo 'php artisan about' | rivervo shell shop   # input from a pipe: the shell ends with it
@@ -71,6 +74,22 @@ echo 'php artisan about' | rivervo shell shop   # input from a pipe: the shell e
 from the API; your terminal is raw while it lasts, and the command exits with the shell's exit code. It closes
 after 30 minutes without activity and after 4 hours at most; at most 2 can be open to a service at once.
 Opening one is noted in the account's activity; what you type is not recorded. Needs a `full` token.
+
+### Public address or internal only
+
+A web service has a public address (`https://<slug>.rivervo.app`, and its custom domains) or is **internal
+only**: it has no public address, no domains and no previews, and only the other services of its application
+reach it, inside their private network. The other code services of the application get its address there,
+public or not, in a variable `RIVERVO_<NAME>_URL` named after it (`RIVERVO_BACKEND_URL=http://backend:8080`);
+`rivervo apps` and `rivervo services info` show it as the internal address.
+
+`rivervo services set-public [app] on|off` switches it; nothing restarts. Turning it off asks first in a
+terminal (Enter means no); in a script, pass `--yes`. A service with custom domains or previews is refused
+until they are removed or turned off, and so is any switch while a deploy is running. It needs a `full` token
+and the Administrator role in the application (or the account owner). `rivervo open` on an internal-only
+service shows its internal address instead of opening a browser.
+
+Services are created in the panel; the API (and so the CLI) does not create them.
 
 `[app]` is a service (see above). Leave it out when the directory is linked (`rivervo link`), when you have
 one application with one code service, or set `--app` / `RIVERVO_APP`. `[application]` (for `--shared` and

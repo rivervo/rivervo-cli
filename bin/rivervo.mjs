@@ -4,7 +4,8 @@
  * One file, no dependencies (Node 22+): it talks to the public API (/api/v1) with a
  * personal API token from Account settings → API tokens.
  *
- *   rivervo login | logout | apps | link | unlink | deploy | logs | env ls|set|rm [--shared] | usage | rollback | open | shell
+ *   rivervo login | logout | apps | services [ls] | services info | services set-public | link | unlink | deploy | logs
+ *           | env ls|set|rm [--shared] | usage | rollback | open | shell
  *
  * Importable for tests: main(argv, io) runs one command and resolves its exit code.
  */
@@ -16,7 +17,7 @@ import { pathToFileURL } from 'node:url'
 import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
 
-export const VERSION = '1.2.0'
+export const VERSION = '1.3.0'
 const DEFAULT_API = 'https://api.rivervo.com/api/v1'
 
 const HELP = `rivervo ${VERSION} — Rivervo Applications from the command line
@@ -24,7 +25,11 @@ const HELP = `rivervo ${VERSION} — Rivervo Applications from the command line
 Usage
   rivervo login [--token <token>] [--api <url>]   save a personal API token
   rivervo logout                                  forget the saved token
-  rivervo apps                                    your applications and their services
+  rivervo apps                                    your applications and their services (also: rivervo services)
+  rivervo services info [app]                     a service: status, public and internal address, repository, resources
+  rivervo services set-public [app] on|off [-y]   a web service's public address on, or off (internal only: reached
+                                                  by the application's other services alone); asks first when turning
+                                                  it off (-y: do not ask). Needs a full token and the Administrator role
   rivervo link [app]                              link this directory to a service (saved in .rivervo)
   rivervo unlink                                  remove this directory's link
   rivervo deploy [app] [--no-build] [--detach]    deploy: build the latest commit (or, with --no-build,
@@ -37,7 +42,7 @@ Usage
   rivervo env ls|set|rm --shared [application] …  the application's shared variables (every code service gets them)
   rivervo usage [application] [--month YYYY-MM]   what the application spent this month, the forecast, the next payment
   rivervo rollback [app] [deployment]             back to an earlier version (default: the previous one)
-  rivervo open [app]                              open the app in the browser
+  rivervo open [app]                              open the app in the browser (an internal-only one has no address)
   rivervo shell [app] [--process web|i2|w1]       an interactive shell in the running service (tinker, psql…);
                                                   web is its first instance, i2… the others, w1… a worker
 
@@ -49,6 +54,7 @@ variable, the directory's link (rivervo link), or your only application's only s
 Options
   --account <id>   work in another account you are a team member of
   --json           print the API's JSON instead of text
+  -y, --yes        do not ask for confirmation (services set-public … off)
   -h, --help       this help        -v, --version
 
 Environment
@@ -74,7 +80,7 @@ export function parseArgs (argv) {
       else if (FLAGS_WITH_VALUE.has(k)) opt[k] = argv[++i]
       else opt[k] = true
     } else if (a.length > 1 && a.startsWith('-') && !/^-\d/.test(a)) {
-      const k = { f: 'follow', n: 'lines', h: 'help', v: 'version' }[a.slice(1)] ?? a.slice(1)
+      const k = { f: 'follow', n: 'lines', h: 'help', v: 'version', y: 'yes' }[a.slice(1)] ?? a.slice(1)
       if (k === 'lines') opt[k] = argv[++i]
       else opt[k] = true
     } else pos.push(a)
@@ -389,11 +395,17 @@ async function cmdApps ({ call, io, opt }) {
   }
   if (opt.json) { io.out(JSON.stringify(res.data, null, 2) + '\n'); return 0 }
   if (!res.data.length) { io.out('No applications yet. Create one in the panel.\n'); return 0 }
-  const rows = [['APPLICATION / SERVICE', 'ID', 'TYPE', 'STATUS', 'URL']]
+  // The API from 1.3: a web service's public address or «internal only», and its address inside the application.
+  const withInternal = res.data.some(p => (p.services ?? []).some(s => 'internal_url' in s || 'public' in s))
+  const rows = [['APPLICATION / SERVICE', 'ID', 'TYPE', 'STATUS', ...(withInternal ? ['INTERNAL'] : []), 'URL']]
+  const blank = withInternal ? ['', '', '', '', ''] : ['', '', '', '']
   for (const p of res.data) {
-    rows.push([`${p.slug}  (${p.name}${p.status && p.status !== 'active' ? `, ${p.status}` : ''})`, '', '', '', ''])
-    if (!p.services?.length) rows.push(['  no services yet', '', '', '', ''])
-    for (const s of p.services ?? []) rows.push([`  ${p.slug}/${s.name}`, s.id, s.type ?? 'web', showStatus(s.status, s.health_status), s.address ? `https://${s.address}` : ''])
+    rows.push([`${p.slug}  (${p.name}${p.status && p.status !== 'active' ? `, ${p.status}` : ''})`, ...blank])
+    if (!p.services?.length) rows.push(['  no services yet', ...blank])
+    for (const s of p.services ?? []) {
+      const url = s.public === false ? 'internal only' : s.address ? `https://${s.address}` : (s.url ?? '')
+      rows.push([`  ${p.slug}/${s.name}`, s.id, s.type ?? 'web', showStatus(s.status, s.health_status), ...(withInternal ? [s.internal_url ?? ''] : []), url])
+    }
   }
   io.out(table(rows))
   return 0
@@ -409,6 +421,92 @@ async function cmdAppsOld ({ call, io, opt }) {
     for (const s of a.services ?? []) rows.push([s.id, `  └ ${s.name} (${s.type})`, showStatus(s.status, s.health), s.url ?? ''])
   }
   io.out(table(rows))
+  return 0
+}
+
+/** rivervo services [ls] | info [app] | set-public [app] on|off. */
+async function cmdServices (ctx) {
+  const { pos, io } = ctx
+  const sub = pos[0]
+  if (sub === undefined || sub === 'ls' || sub === 'list') return cmdApps(ctx)
+  if (sub === 'info' || sub === 'show') return cmdServiceInfo({ ...ctx, pos: pos.slice(1) })
+  if (sub === 'set-public') return cmdSetPublic({ ...ctx, pos: pos.slice(1) })
+  io.err('Usage: rivervo services [ls] | services info [app] | services set-public [app] on|off [--yes]\n')
+  return 1
+}
+
+const memory = mb => mb >= 1024 ? `${+(mb / 1024).toFixed(1)} GB` : `${mb} MB`
+
+/** One service (GET /apps/{id}): its application, status, addresses, repository and resources. */
+async function cmdServiceInfo (ctx) {
+  const { call, pos, io, opt } = ctx
+  const app = await resolveApp(call, pos[0] ?? ctx.appRef, ctx)
+  const { data: a } = await call('GET', `/apps/${app.id}`)
+  if (opt.json) { io.out(JSON.stringify(a, null, 2) + '\n'); return 0 }
+  const s = { ...a, project: a.project ?? app.project }
+  const r = a.resources ?? {}
+  const rows = [
+    ['Application', s.project?.id ? `${s.project.name} (${s.project.slug})` : '—'],
+    ['Type', a.type ?? 'web'],
+    ['Status', a.status ?? '—'],
+    ['Health', a.health ?? '—'],
+  ]
+  // A web service: its public address or «internal only»; where the application's other services reach it.
+  if (a.public === false) rows.push(['Public address', 'internal only'])
+  else if (a.url) rows.push(['Public address', a.url])
+  if (a.internal_url) rows.push(['Internal address', a.internal_url])
+  const domains = (a.domains ?? []).map(d => d.name).filter(Boolean)
+  if (domains.length) rows.push(['Domains', domains.join(', ')])
+  if (a.repo) rows.push(['Repository', a.repo])
+  if (a.branch) rows.push(['Branch', a.branch])
+  const res = [r.memory_mb ? memory(r.memory_mb) : null, r.cpus ? `${r.cpus} CPU` : null, r.disk_gb ? `${r.disk_gb} GB disk` : null].filter(Boolean)
+  if (res.length) rows.push(['Resources', res.join(' · ')])
+  io.out(`${label(s)} (service ${a.id})\n\n${table(rows)}`)
+  return 0
+}
+
+const PUBLIC_REFUSED = {
+  domains: 'Remove the custom domains of this service first: an internal-only service has no domains.',
+  previews: 'Turn off previews of this service first: an internal-only service has no previews.',
+  busy: 'Wait for the running deploy to finish.',
+  not_web: 'Only a web service has a public address.',
+}
+
+/**
+ * A web service's public address on or off (PUT /apps/{id}/public). Off — internal only — asks first in a
+ * terminal (Enter: no); without one it needs --yes. Nothing restarts.
+ */
+async function cmdSetPublic (ctx) {
+  const { call, pos, io, opt } = ctx
+  const usage = 'Usage: rivervo services set-public [app] on|off [--yes]\n'
+  if (!pos.length || pos.length > 2) { io.err(usage); return 1 }
+  const word = lc(pos.at(-1))
+  const wanted = ['on', 'true', 'public'].includes(word) ? true : ['off', 'false', 'internal'].includes(word) ? false : null
+  if (wanted === null) { io.err(`Not on or off: ${pos.at(-1)}\n${usage}`); return 1 }
+  const app = await resolveApp(call, pos.length === 2 ? pos[0] : ctx.appRef, ctx)
+  const name = label(app)
+  if (!wanted && app.public !== false && !opt.yes) {
+    const what = `its public address${app.url ? ` ${app.url}` : ''}; only the application's other services reach it${app.internal_url ? `, at ${app.internal_url}` : ''}`
+    const tty = 'isTTY' in io ? io.isTTY : Boolean(process.stdin.isTTY && process.stdout.isTTY)
+    if (!tty) { io.err(`Making ${name} internal only removes ${what}.\nPass --yes to do it without a question.\n`); return 1 }
+    const answer = (await ask(io, `Make ${name} internal only? It loses ${what}. [y/N] `)).trim()
+    if (!/^y(es)?$/i.test(answer)) { io.err('Nothing changed.\n'); return 1 }
+  }
+  let res
+  try {
+    res = await call('PUT', `/apps/${app.id}/public`, { body: { public: wanted } })
+  } catch (e) {
+    if (e.status !== 422 || !e.body?.reason) throw e
+    io.err(`${e.body.message || PUBLIC_REFUSED[e.body.reason] || e.message}\n`)
+    return 1
+  }
+  if (opt.json) { io.out(JSON.stringify(res, null, 2) + '\n'); return 0 }
+  const a = res.data ?? {}
+  const internal = a.internal_url ?? app.internal_url
+  const later = res.applied === false ? ' It is applied with its next deploy.' : ''
+  // No full stop right after the address: it would be copied with it.
+  if (wanted) io.out(`${name} now has a public address${a.url ? `: ${a.url}` : '.'}${later ? `\n${later.trim()}` : ''}\n`)
+  else io.out(`${name} is now internal only.${internal ? ` Other services of the application reach it at ${internal}.` : ''}${later}\n`)
   return 0
 }
 
@@ -624,6 +722,10 @@ async function cmdOpen (ctx) {
   const { call, pos, io, env } = ctx
   const app = await resolveApp(call, pos[0] ?? ctx.appRef, ctx)
   const url = app.url
+  if (!url && app.public === false) {
+    io.err(`${label(app)} is internal only: it has no public address.${app.internal_url ? ` Other services of the application reach it at ${app.internal_url}.` : ''}\n`)
+    return 1
+  }
   if (!url) { io.err(`${label(app)} has no web address.\n`); return 1 }
   io.out(url + '\n')
   openUrl(url, env)
@@ -722,7 +824,7 @@ async function cmdShell (ctx) {
   })
 }
 
-const COMMANDS = { shell: cmdShell, login: cmdLogin, logout: cmdLogout, apps: cmdApps, ls: cmdApps, link: cmdLink, unlink: cmdUnlink, deploy: cmdDeploy, rollback: cmdRollback, logs: cmdLogs, env: cmdEnv, usage: cmdUsage, open: cmdOpen }
+const COMMANDS = { shell: cmdShell, login: cmdLogin, logout: cmdLogout, apps: cmdApps, ls: cmdApps, services: cmdServices, link: cmdLink, unlink: cmdUnlink, deploy: cmdDeploy, rollback: cmdRollback, logs: cmdLogs, env: cmdEnv, usage: cmdUsage, open: cmdOpen }
 
 /** Run one command. @returns {Promise<number>} the exit code */
 export async function main (argv = process.argv.slice(2), io = {}) {
@@ -748,6 +850,7 @@ export async function main (argv = process.argv.slice(2), io = {}) {
     if (!(e instanceof ApiError)) throw e
     if (e.status === 401) io.err('The token is not valid (revoked or expired). Run: rivervo login\n')
     else if (e.status === 403 && e.body?.reason === 'token_scope') io.err(`${e.message}\n(This needs a “${e.body.needs}” token.)\n`)
+    else if (e.status === 403 && e.body?.reason === 'forbidden' && e.body?.needs === 'admin') io.err(`${e.message}\n(This needs the Administrator role in the application${e.body.role ? `; yours is ${e.body.role}` : ''}.)\n`)
     else if (e.status === 429) io.err(`${e.message}\n`)
     else {
       io.err(`${e.message}\n`)
