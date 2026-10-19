@@ -14,7 +14,7 @@ const SERVICES = [
   { id: 8, name: 'worker', slug: 'shopx-worker', type: 'worker', status: 'live', url: null, public: null, internal_url: null, project: SHOP, services: [] },
   { id: 9, name: 'db', slug: 'shopx-db', type: 'postgres', status: 'live', url: null, public: null, internal_url: null, project: SHOP, services: [] },
 ]
-const DEFAULTS = { app: [512, 1, 5], data: [1024, 1, 10], redis: [256, 1, 5] }
+const DEFAULTS = { app: [512, 1, 5], data: [1024, 1, 10], redis: [256, 1, 5], nats: [256, 1, 5], rabbitmq: [1024, 1, 10], kafka: [1024, 1, 10] }
 const QUOTE = { monthly_cents_before: 2000, monthly_cents_after: 3200, monthly_delta_cents: 1200, charged_now_cents: 310, currency: 'USD', trial: false, trial_days: 0, state: 'paid', summary: '+$12.00/mo; $3.10 charged now (prorated)' }
 const DEARER = { ...QUOTE, monthly_cents_after: 3500, monthly_delta_cents: 1500, charged_now_cents: 400 }
 
@@ -30,7 +30,7 @@ const norm = b => JSON.stringify(Object.keys(b).sort().map(k => [k, typeof b[k] 
 function quote (body) {
   const token = `tk-${++state.issued}`
   state.tokens.set(token, norm(body))
-  const kind = body.type === 'redis' ? 'redis' : ['postgres', 'mysql'].includes(body.type) ? 'data' : 'app'
+  const kind = ['redis', 'nats', 'rabbitmq', 'kafka'].includes(body.type) ? body.type : ['postgres', 'mysql'].includes(body.type) ? 'data' : 'app'
   const [m, c, d] = DEFAULTS[kind]
   return { quote: state.quote, service: { type: body.type, name: body.name, memory_mb: body.memory_mb ?? m, cpus: body.cpus ?? c, disk_gb: body.disk_gb ?? d }, quote_token: token, expires_at: '2026-10-19T10:10:00+00:00', service_defaults: DEFAULTS }
 }
@@ -53,6 +53,8 @@ function route (req, body, url) {
     }
     const id = 12
     const web = b.type === 'web'
+    // Kafka is a template: the API answers with a worker made from it.
+    if (b.type === 'kafka') return [201, { data: { id, name: b.name, slug: `shop-${b.name}`, type: 'worker', template: 'kafka', status: 'deploying', public: null, url: null, internal_url: null, project: SHOP } }]
     return [201, { data: { id, name: b.name, slug: `shop-${b.name}`, type: b.type, status: 'deploying', public: web ? b.public : null, url: web && b.public ? `https://shop-${b.name}.rivervo.app` : null, internal_url: web ? `http://${b.name}:${b.port ?? 8080}` : null, project: SHOP } }]
   }
   return [404, { message: 'Not found' }]
@@ -102,7 +104,7 @@ test('interactive: a web service, internal only, from an image — asked step by
   })
   assert.equal(r.code, 0, r.err)
   assert.deepEqual(r.asked, [
-    'Type [1-6]: ',
+    'Type [1-9]: ',
     'Name (lowercase letters, digits and -, starting with a letter): ',
     'Name (lowercase letters, digits and -, starting with a letter): ',   // «Api» is not a name: asked again
     'A public address, or internal only (reached by the application\'s other services alone)? [public/internal]: ',
@@ -198,6 +200,27 @@ test('a data service: no source, the kind\'s resources from the API', async () =
   assert.equal(r.code, 0, r.err)
   assert.deepEqual(posts('services'), [{ type: 'postgres', name: 'db2', quote_token: 'tk-1' }])
   assert.match(r.out, /Added shop\/db2 \(service 12\): PostgreSQL\.\nIt is starting; rivervo services info shop\/db2 shows its status\.\n/)
+})
+
+test('message brokers and the Kafka template: no source, their variables named, their defaults asked', async () => {
+  let r = await run(['services', 'add', 'shop', '--type', 'rabbitmq', '--name', 'mq', '--yes'])
+  assert.equal(r.code, 0, r.err)
+  assert.deepEqual(posts('services'), [{ type: 'rabbitmq', name: 'mq', quote_token: 'tk-1' }])
+  assert.match(r.out, /Added shop\/mq \(service 12\): RabbitMQ\.\nOnly the application's services reach it; they get AMQP_URL and RABBITMQ_\* with their next deploy\.\nIt is starting; rivervo services info shop\/mq shows its status\.\n/)
+
+  r = await run(['services', 'add', 'shop', '--type', 'nats', '--name', 'events', '--source', 'image', '--yes'])
+  assert.equal(r.code, 1)
+  assert.match(r.err, /A NATS \(JetStream\) service has no code/)
+
+  r = await run(['services', 'add', 'shop', '--type', 'kafka', '--name', 'kafka', '--var', 'KAFKA_NUM_PARTITIONS=3', '--yes'])
+  assert.equal(r.code, 0, r.err)
+  assert.deepEqual(posts('services').at(-1), { type: 'kafka', name: 'kafka', vars: [{ key: 'KAFKA_NUM_PARTITIONS', value: '3' }], quote_token: 'tk-2' })
+  assert.match(r.out, /Added shop\/kafka \(service 12\): Kafka \(one broker, template\)\.\nOnly the application's services reach it; they get KAFKA_BROKERS with their next deploy\.\n/)
+
+  // In a terminal the kind's defaults come from the API.
+  r = await run(['services', 'add', 'shop', '--type', 'nats', '--name', 'events'], { answers: ['', '', '', 'y'] })
+  assert.equal(r.code, 0, r.err)
+  assert.deepEqual(r.asked.slice(0, 3), ['Memory, MB [256]: ', 'CPUs [1]: ', 'Disk, GB [5]: '])
 })
 
 test('quote_required: the new price is shown and asked about again; without a terminal it stops', async () => {

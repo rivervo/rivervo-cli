@@ -17,7 +17,7 @@ import { pathToFileURL } from 'node:url'
 import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
 
-export const VERSION = '1.3.3'
+export const VERSION = '1.4.0'
 const DEFAULT_API = 'https://api.rivervo.com/api/v1'
 
 const HELP = `rivervo ${VERSION} — Rivervo Applications from the command line
@@ -56,7 +56,8 @@ variable, the directory's link (rivervo link), or your only application's only s
 [application] is an application's short name or name (or any of its services).
 
 rivervo services add flags (in a terminal, what is left out is asked)
-  --type web|worker|cron|postgres|mysql|redis   --name <name>   --public | --internal (web: one is required)
+  --type web|worker|cron|postgres|mysql|redis|nats|rabbitmq|kafka   --name <name>   --public | --internal (web: one is required)
+           nats, rabbitmq: message brokers (internal only); kafka: one Kafka broker from a template
   --source project|repo|image (web, worker; cron runs the application's code)
   project: --from <service> --command <command>     repo: --repo owner/name [--branch <branch>]
   image:   --image <ref> [--port <n>] [--command <command>] [--registry-user <u> --registry-password <p>]
@@ -170,7 +171,7 @@ function table (rows) {
   return rows.map(r => r.map((c, i) => i === r.length - 1 ? String(c ?? '') : String(c ?? '').padEnd(widths[i])).join('  ').trimEnd()).join('\n') + '\n'
 }
 
-const DATA_TYPES = ['postgres', 'mysql', 'redis']
+const DATA_TYPES = ['postgres', 'mysql', 'redis', 'nats', 'rabbitmq']
 const isCode = s => !DATA_TYPES.includes(s.type ?? 'web')
 const lc = v => String(v ?? '').toLowerCase()
 
@@ -531,12 +532,15 @@ async function cmdSetPublic (ctx) {
 
 // ── services add ─────────────────────────────────────────────────────────
 
-const SERVICE_TYPES = ['web', 'worker', 'cron', 'postgres', 'mysql', 'redis']
-const TYPE_LABEL = { web: 'web service', worker: 'background worker', cron: 'cron job', postgres: 'PostgreSQL', mysql: 'MySQL', redis: 'Valkey (Redis)' }
+const SERVICE_TYPES = ['web', 'worker', 'cron', 'postgres', 'mysql', 'redis', 'nats', 'rabbitmq', 'kafka']
+// nats, rabbitmq: message brokers (1.4.0, internal only); kafka: a template — a worker running one Kafka broker.
+const TYPE_LABEL = { web: 'web service', worker: 'background worker', cron: 'cron job', postgres: 'PostgreSQL', mysql: 'MySQL', redis: 'Valkey (Redis)', nats: 'NATS (JetStream)', rabbitmq: 'RabbitMQ', kafka: 'Kafka (one broker, template)' }
+// What the application's other services get from it (shown after it is added).
+const TYPE_VARS = { nats: 'NATS_URL', rabbitmq: 'AMQP_URL and RABBITMQ_*', kafka: 'KAFKA_BROKERS' }
 const SOURCES = { project: "the application's code (as one of its services runs it)", repo: 'a GitHub repository', image: 'a Docker image' }
 // [memory MB, CPUs, disk GB] by kind when the API's quote cannot be had (the API's service_defaults win).
-const SERVICE_DEFAULTS = { app: [512, 1, 5], data: [1024, 1, 10], redis: [256, 1, 5] }
-const kindOf = type => type === 'redis' ? 'redis' : (type === 'postgres' || type === 'mysql') ? 'data' : 'app'
+const SERVICE_DEFAULTS = { app: [512, 1, 5], data: [1024, 1, 10], redis: [256, 1, 5], nats: [256, 1, 5], rabbitmq: [1024, 1, 10], kafka: [1024, 1, 10] }
+const kindOf = type => ['redis', 'nats', 'rabbitmq', 'kafka'].includes(type) ? type : (type === 'postgres' || type === 'mysql') ? 'data' : 'app'
 
 /** Thrown when a value is missing and there is no terminal to ask in. */
 class Missing extends Error {}
@@ -592,10 +596,10 @@ async function cmdServiceAdd (ctx) {
   const number = (int) => a => (int ? /^\d+$/ : /^\d+(\.\d+)?$/).test(a) && Number(a) > 0 ? Number(a) : undefined
   const listed = (list) => list.map((x, i) => `  ${i + 1}) ${x}`).join('\n') + '\n'
 
-  let body
+  let body, type
   try {
     if (tty && !opt.type) io.out(`What kind of service?\n${listed(SERVICE_TYPES.map(t => `${t.padEnd(9)}${TYPE_LABEL[t]}`))}`)
-    const type = await value(opt.type, '--type (web, worker, cron, postgres, mysql or redis)', `Type [1-${SERVICE_TYPES.length}]: `, choose(SERVICE_TYPES))
+    type = await value(opt.type, '--type (web, worker, cron, postgres, mysql, redis, nats, rabbitmq or kafka)', `Type [1-${SERVICE_TYPES.length}]: `, choose(SERVICE_TYPES))
     const name = await value(opt.name, '--name', 'Name (lowercase letters, digits and -, starting with a letter): ', a => /^[a-z][a-z0-9-]{0,29}$/.test(a) ? a : undefined)
     body = { type, name }
     if (type === 'web') {
@@ -704,7 +708,9 @@ async function cmdServiceAdd (ctx) {
       const where = s.type !== 'web' ? '' : s.public === false
         ? `, internal only${s.internal_url ? ` (other services of the application reach it at ${s.internal_url})` : ''}`
         : `${s.url ? `, public at ${s.url}` : ''}${s.internal_url ? ` (inside the application: ${s.internal_url})` : ''}`
-      io.out(`Added ${label(svc)} (service ${s.id}): ${TYPE_LABEL[s.type] ?? s.type}${where}.\n`)
+      const kind = s.template ?? (s.type === 'worker' && type === 'kafka' ? 'kafka' : s.type)
+      io.out(`Added ${label(svc)} (service ${s.id}): ${TYPE_LABEL[kind] ?? s.type}${where}.\n`)
+      if (TYPE_VARS[kind]) io.out(`Only the application's services reach it; they get ${TYPE_VARS[kind]} with their next deploy.\n`)
       io.out(kindOf(s.type) === 'app'
         ? `It is starting; follow it with: rivervo logs ${label(svc)} -f\n`
         : `It is starting; rivervo services info ${label(svc)} shows its status.\n`)

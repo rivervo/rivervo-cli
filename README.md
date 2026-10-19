@@ -96,8 +96,11 @@ New applications are created in the panel; services are added to one with `river
 
 ### Adding a service
 
-`rivervo services add [application]` adds a web service, a background worker, a cron job, or a PostgreSQL,
-MySQL or Valkey (`redis`) database to an existing application. In a terminal it asks for what the flags leave
+`rivervo services add [application]` adds a web service, a background worker, a cron job, a PostgreSQL,
+MySQL or Valkey (`redis`) database, a NATS (`nats`, with JetStream) or RabbitMQ (`rabbitmq`) message broker, or
+Kafka (`kafka` — a template: one Kafka broker for development and moderate loads) to an existing application.
+Brokers and Kafka are reached only by the application's services, which get `NATS_URL`, `AMQP_URL` and
+`RABBITMQ_*`, or `KAFKA_BROKERS` by themselves. In a terminal it asks for what the flags leave
 out, step by step: the type, the name, for a web service a public address or internal only (no default: one
 has to be chosen), where the code comes from (`project` — the code of one of the application's services, run
 with another command; `repo` — a GitHub repository; `image` — a Docker image), and the resources, with the
@@ -116,6 +119,8 @@ rivervo services add shop --type web --name api --internal --source image --imag
 rivervo services add shop --type worker --name jobs --source project --from web --command 'php artisan queue:work' --yes
 rivervo services add shop --type cron --name nightly --command 'php artisan backup' --schedule '0 3 * * *' --yes
 rivervo services add shop --type postgres --name db --memory 2048 --yes
+rivervo services add shop --type rabbitmq --name mq --yes      # at least 512 MB of memory
+rivervo services add shop --type kafka --name kafka --yes
 rivervo services add shop --type web --name site --public --source repo --repo acme/site --branch main \
   --var APP_ENV=production --yes
 ```
