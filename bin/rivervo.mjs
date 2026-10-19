@@ -4,8 +4,8 @@
  * One file, no dependencies (Node 22+): it talks to the public API (/api/v1) with a
  * personal API token from Account settings → API tokens.
  *
- *   rivervo login | logout | apps | services [ls] | services info | services set-public | link | unlink | deploy | logs
- *           | env ls|set|rm [--shared] | usage | rollback | open | shell
+ *   rivervo login | logout | apps | services [ls] | services info | services set-public | services add | link | unlink
+ *           | deploy | logs | env ls|set|rm [--shared] | usage | rollback | open | shell
  *
  * Importable for tests: main(argv, io) runs one command and resolves its exit code.
  */
@@ -30,6 +30,10 @@ Usage
   rivervo services set-public [app] on|off [-y]   a web service's public address on, or off (internal only: reached
                                                   by the application's other services alone); asks first when turning
                                                   it off (-y: do not ask). Needs a full token and the Administrator role
+  rivervo services add [application] [flags] [-y]
+                                                  add a service to an application: asks what the flags leave out
+                                                  (in a terminal), shows the price, adds it once you confirm.
+                                                  Needs a full token and the Administrator role (see below)
   rivervo link [app]                              link this directory to a service (saved in .rivervo)
   rivervo unlink                                  remove this directory's link
   rivervo deploy [app] [--no-build] [--detach]    deploy: build the latest commit (or, with --no-build,
@@ -51,10 +55,18 @@ an application alone (shop) when it has one code service. Without it: --app, the
 variable, the directory's link (rivervo link), or your only application's only service.
 [application] is an application's short name or name (or any of its services).
 
+rivervo services add flags (in a terminal, what is left out is asked)
+  --type web|worker|cron|postgres|mysql|redis   --name <name>   --public | --internal (web: one is required)
+  --source project|repo|image (web, worker; cron runs the application's code)
+  project: --from <service> --command <command>     repo: --repo owner/name [--branch <branch>]
+  image:   --image <ref> [--port <n>] [--command <command>] [--registry-user <u> --registry-password <p>]
+  cron:    --schedule '<5 cron fields, UTC>'        --memory <MB> --cpus <n> --disk <GB>   --var KEY=value …
+  Without a terminal, --yes adds it at the price shown; without --yes only the price is shown.
+
 Options
   --account <id>   work in another account you are a team member of
   --json           print the API's JSON instead of text
-  -y, --yes        do not ask for confirmation (services set-public … off)
+  -y, --yes        do not ask for confirmation (services set-public … off, services add)
   -h, --help       this help        -v, --version
 
 Environment
@@ -65,7 +77,11 @@ Environment
 
 // ── arguments ────────────────────────────────────────────────────────────
 
-const FLAGS_WITH_VALUE = new Set(['token', 'api', 'app', 'account', 'lines', 'n', 'process', 'target', 'month'])
+const FLAGS_WITH_VALUE = new Set(['token', 'api', 'app', 'account', 'lines', 'n', 'process', 'target', 'month',
+  'type', 'name', 'source', 'from', 'command', 'repo', 'branch', 'image', 'port', 'schedule', 'memory', 'cpus', 'disk', 'var',
+  'registry-user', 'registry-password'])
+/** Flags that may be given more than once (a list). */
+const FLAGS_REPEATED = new Set(['var'])
 
 export function parseArgs (argv) {
   const pos = []
@@ -76,6 +92,7 @@ export function parseArgs (argv) {
     if (a.startsWith('--')) {
       const [k, v] = a.slice(2).split(/=(.*)/s, 2)
       if (k.startsWith('no-')) opt[k.slice(3)] = false
+      else if (FLAGS_REPEATED.has(k)) (opt[k] ??= []).push(v !== undefined ? v : argv[++i])
       else if (v !== undefined) opt[k] = v
       else if (FLAGS_WITH_VALUE.has(k)) opt[k] = argv[++i]
       else opt[k] = true
@@ -431,7 +448,8 @@ async function cmdServices (ctx) {
   if (sub === undefined || sub === 'ls' || sub === 'list') return cmdApps(ctx)
   if (sub === 'info' || sub === 'show') return cmdServiceInfo({ ...ctx, pos: pos.slice(1) })
   if (sub === 'set-public') return cmdSetPublic({ ...ctx, pos: pos.slice(1) })
-  io.err('Usage: rivervo services [ls] | services info [app] | services set-public [app] on|off [--yes]\n')
+  if (sub === 'add') return cmdServiceAdd({ ...ctx, pos: pos.slice(1) })
+  io.err('Usage: rivervo services [ls] | services info [app] | services set-public [app] on|off [--yes] | services add [application] …\n')
   return 1
 }
 
@@ -465,6 +483,8 @@ async function cmdServiceInfo (ctx) {
   return 0
 }
 
+const isTerminal = io => 'isTTY' in io ? io.isTTY : Boolean(process.stdin.isTTY && process.stdout.isTTY)
+
 const PUBLIC_REFUSED = {
   domains: 'Remove the custom domains of this service first: an internal-only service has no domains.',
   previews: 'Turn off previews of this service first: an internal-only service has no previews.',
@@ -487,8 +507,7 @@ async function cmdSetPublic (ctx) {
   const name = label(app)
   if (!wanted && app.public !== false && !opt.yes) {
     const what = `its public address${app.url ? ` ${app.url}` : ''}; only the application's other services reach it${app.internal_url ? `, at ${app.internal_url}` : ''}`
-    const tty = 'isTTY' in io ? io.isTTY : Boolean(process.stdin.isTTY && process.stdout.isTTY)
-    if (!tty) { io.err(`Making ${name} internal only removes ${what}.\nPass --yes to do it without a question.\n`); return 1 }
+    if (!isTerminal(io)) { io.err(`Making ${name} internal only removes ${what}.\nPass --yes to do it without a question.\n`); return 1 }
     const answer = (await ask(io, `Make ${name} internal only? It loses ${what}. [y/N] `)).trim()
     if (!/^y(es)?$/i.test(answer)) { io.err('Nothing changed.\n'); return 1 }
   }
@@ -508,6 +527,197 @@ async function cmdSetPublic (ctx) {
   if (wanted) io.out(`${name} now has a public address${a.url ? `: ${a.url}` : '.'}${later ? `\n${later.trim()}` : ''}\n`)
   else io.out(`${name} is now internal only.${internal ? ` Other services of the application reach it at ${internal}.` : ''}${later}\n`)
   return 0
+}
+
+// ── services add ─────────────────────────────────────────────────────────
+
+const SERVICE_TYPES = ['web', 'worker', 'cron', 'postgres', 'mysql', 'redis']
+const TYPE_LABEL = { web: 'web service', worker: 'background worker', cron: 'cron job', postgres: 'PostgreSQL', mysql: 'MySQL', redis: 'Valkey (Redis)' }
+const SOURCES = { project: "the application's code (as one of its services runs it)", repo: 'a GitHub repository', image: 'a Docker image' }
+// [memory MB, CPUs, disk GB] by kind when the API's quote cannot be had (the API's service_defaults win).
+const SERVICE_DEFAULTS = { app: [512, 1, 5], data: [1024, 1, 10], redis: [256, 1, 5] }
+const kindOf = type => type === 'redis' ? 'redis' : (type === 'postgres' || type === 'mysql') ? 'data' : 'app'
+
+/** Thrown when a value is missing and there is no terminal to ask in. */
+class Missing extends Error {}
+
+/** What adding the service does to the application's bill, in one sentence (amounts without tax). */
+export function priceLine (q, project) {
+  const delta = money(q.monthly_delta_cents)
+  const change = `This adds ${delta} a month to ${project.slug} (now ${money(q.monthly_cents_before)} → ${money(q.monthly_cents_after)})`
+  const line = {
+    paid: `${change}; charged now: ${money(q.charged_now_cents)} (prorated).`,
+    trial: `${change}; not billed during the trial.`,
+    internal: `${change}, but ${project.slug} is an internal application: nothing is charged.`,
+    unpaid: q.trial
+      ? `${project.slug} will cost ${money(q.monthly_cents_after)} a month; the first ${q.trial_days} days are free.`
+      : `${project.slug} will cost ${money(q.monthly_cents_after)} a month; charged now: ${money(q.charged_now_cents)}.`,
+  }[q.state] ?? `${q.summary ?? change}.`
+  return `${line} Amounts in ${q.currency ?? 'USD'}, without tax.`
+}
+
+/**
+ * Add a service to an existing application: its quote first (POST …/services/quote), shown and confirmed, then
+ * the same body with the quote's token (POST …/services). In a terminal it asks for whatever the flags leave out;
+ * without one every needed flag must be given, and --yes to add it.
+ */
+async function cmdServiceAdd (ctx) {
+  const { call, pos, io, opt } = ctx
+  if (pos.length > 1) { io.err('Usage: rivervo services add [application] [--type …] [--yes]\n'); return 1 }
+  const tty = isTerminal(io)
+  const project = await resolveProject(call, pos[0] ?? ctx.appRef, ctx)
+  const { data: apps } = await call('GET', '/apps')
+  const code = flatten(apps).filter(s => String(s.project?.id) === String(project.id) && ['web', 'worker', 'cron'].includes(s.type ?? 'web'))
+  const quoteUrl = `/apps/projects/${project.id}/services/quote`
+
+  /** A value from its flag, else asked (again until `check` takes it), else — no terminal — an error naming the flag. */
+  const value = async (given, flag, question, check, { optional = false } = {}) => {
+    if (given !== undefined && given !== true) {
+      const v = check(String(given))
+      if (v === undefined) throw new Missing(`Not a valid ${flag}: ${given}`)
+      return v
+    }
+    if (!tty) {
+      if (optional) return null
+      throw new Missing(`Missing ${flag}. Without a terminal to ask in, give it on the command line.`)
+    }
+    for (;;) {
+      const answer = (await ask(io, question)).trim()
+      if (answer === '' && optional) return null
+      const v = answer === '' ? undefined : check(answer)
+      if (v !== undefined) return v
+    }
+  }
+  const choose = (list) => a => list.includes(lc(a)) ? lc(a) : (/^\d+$/.test(a) && list[Number(a) - 1]) || undefined
+  const number = (int) => a => (int ? /^\d+$/ : /^\d+(\.\d+)?$/).test(a) && Number(a) > 0 ? Number(a) : undefined
+  const listed = (list) => list.map((x, i) => `  ${i + 1}) ${x}`).join('\n') + '\n'
+
+  let body
+  try {
+    if (tty && !opt.type) io.out(`What kind of service?\n${listed(SERVICE_TYPES.map(t => `${t.padEnd(9)}${TYPE_LABEL[t]}`))}`)
+    const type = await value(opt.type, '--type (web, worker, cron, postgres, mysql or redis)', `Type [1-${SERVICE_TYPES.length}]: `, choose(SERVICE_TYPES))
+    const name = await value(opt.name, '--name', 'Name (lowercase letters, digits and -, starting with a letter): ', a => /^[a-z][a-z0-9-]{0,29}$/.test(a) ? a : undefined)
+    body = { type, name }
+    if (type === 'web') {
+      if (opt.public === true && opt.internal === true) throw new Missing('Give --public or --internal, not both.')
+      const given = opt.public === true ? 'public' : opt.internal === true ? 'internal' : undefined
+      body.public = (await value(given, '--public or --internal (a web service has a public address or is internal only)',
+        'A public address, or internal only (reached by the application\'s other services alone)? [public/internal]: ',
+        a => ({ p: 'public', public: 'public', i: 'internal', internal: 'internal' })[lc(a)])) === 'public'
+    }
+    const isData = kindOf(type) !== 'app'
+    if (isData && (opt.source || opt.repo || opt.image || opt.command || opt.from)) throw new Missing(`A ${TYPE_LABEL[type]} service has no code: leave out --source, --from, --command, --repo and --image.`)
+    if (!isData) {
+      let source = 'project'
+      if (type === 'cron') {
+        if (opt.source && opt.source !== 'project') throw new Missing('A cron job runs the application\'s code: --source project (or leave it out).')
+      } else {
+        if (tty && !opt.source) io.out(`Where does its code come from?\n${listed(Object.entries(SOURCES).map(([k, v]) => `${k.padEnd(9)}${v}`))}`)
+        source = await value(opt.source, '--source (project, repo or image)', 'Source [1-3]: ', choose(Object.keys(SOURCES)))
+      }
+      body.source = source
+      if (source === 'project') {
+        if (!code.length) throw new Missing(`${project.slug} has no code service to take the code from; use --source repo or image.`)
+        // In the list: its number there; also its name or id.
+        const byRef = a => (/^\d+$/.test(a) && code[Number(a) - 1]) || code.find(s => lc(s.name) === lc(a) || String(s.id) === a)
+        if (opt.from !== undefined) {
+          const hit = code.find(s => lc(s.name) === lc(opt.from) || String(s.id) === String(opt.from))
+          if (!hit) throw new Missing(`${project.slug} has no code service “${opt.from}”. Its code services: ${code.map(s => s.name).join(', ')}`)
+          body.image_from = hit.id
+        } else if (tty) {
+          io.out(`Whose code does it run?\n${listed(code.map(s => `${s.name.padEnd(12)}${s.type ?? 'web'}`))}`)
+          const pick = await value(undefined, '--from', `Service [1]: `, a => byRef(a), { optional: true })
+          body.image_from = (pick ?? code[0]).id
+        }
+        body.command = await value(opt.command, '--command', 'Command to run: ', a => a)
+      } else if (source === 'repo') {
+        body.repo = await value(opt.repo, '--repo (owner/name on GitHub)', 'Repository (owner/name on GitHub): ', a => /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(a) ? a : undefined)
+        const branch = await value(opt.branch, '--branch', 'Branch (Enter: the default one): ', a => a, { optional: true })
+        if (branch) body.branch = branch
+      } else {
+        body.image = await value(opt.image, '--image (e.g. nginx:1.27)', 'Image (e.g. nginx:1.27): ', a => a)
+        if (type === 'web') {
+          const port = await value(opt.port, '--port', 'Port it listens on [8080]: ', number(true), { optional: true })
+          if (port) body.port = port
+        }
+        const command = await value(opt.command, '--command', 'Command (Enter: the image\'s own): ', a => a, { optional: true })
+        if (command) body.command = command
+        if (opt['registry-user'] || opt['registry-password']) {
+          body.registry_username = opt['registry-user']
+          body.registry_password = opt['registry-password']
+        }
+      }
+      if (type === 'cron') body.schedule = await value(opt.schedule, '--schedule (5 cron fields, UTC)', 'Schedule (5 cron fields, UTC, e.g. */15 * * * *): ', a => /^(\S+\s+){4}\S+$/.test(a) ? a : undefined)
+    }
+    const vars = []
+    for (const a of opt.var ?? []) {
+      const m = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s.exec(a)
+      if (!m) throw new Missing(`Not KEY=value: ${a}`)
+      vars.push({ key: m[1], value: m[2] })
+    }
+    if (vars.length) body.vars = vars
+    // Resources: the flags; in a terminal the rest is asked with the kind's defaults (the API's, from a first quote).
+    const flags = { memory_mb: [opt.memory, '--memory', number(true)], cpus: [opt.cpus, '--cpus', number(false)], disk_gb: [opt.disk, '--disk', number(true)] }
+    for (const [k, [given, flag, check]] of Object.entries(flags)) if (given !== undefined) body[k] = await value(given, flag, '', check)
+    if (tty && Object.keys(flags).some(k => body[k] === undefined)) {
+      let defaults = SERVICE_DEFAULTS
+      try {
+        defaults = (await call('POST', quoteUrl, { body: { type, name } })).service_defaults ?? SERVICE_DEFAULTS
+      } catch (e) {
+        if (!(e.status === 0 || e.status >= 500)) throw e
+      }
+      const [mem, cpus, disk] = defaults[kindOf(type)] ?? SERVICE_DEFAULTS[kindOf(type)]
+      const questions = { memory_mb: [`Memory, MB [${mem}]: `, mem], cpus: [`CPUs [${cpus}]: `, cpus], disk_gb: [`Disk, GB [${disk}]: `, disk] }
+      for (const [k, [question, def]] of Object.entries(questions)) {
+        if (body[k] === undefined) body[k] = (await value(undefined, flags[k][1], question, flags[k][2], { optional: true })) ?? def
+      }
+    }
+  } catch (e) {
+    if (!(e instanceof Missing)) throw e
+    io.err(`${e.message}\n`)
+    return 1
+  }
+
+  let res = await call('POST', quoteUrl, { body })
+  // --yes answers the first price; a new one (the quote expired or the price changed) is asked about again.
+  const confirm = async (round) => {
+    if (opt.yes && (round === 0 || !tty)) return true
+    if (!tty) return false
+    return /^y(es)?$/i.test((await ask(io, 'Add the service? [y/N] ')).trim())
+  }
+  for (let round = 0; ; round++) {
+    if (!opt.json) io.out(`${priceLine(res.quote ?? {}, project)}\n`)
+    if (!(await confirm(round))) {
+      if (!tty) {
+        if (opt.json) io.out(JSON.stringify(res, null, 2) + '\n')
+        io.err('Pass --yes to add it.\n')
+      } else io.err('Nothing added.\n')
+      return 1
+    }
+    try {
+      const { data: s } = await call('POST', `/apps/projects/${project.id}/services`, { body: { ...body, quote_token: res.quote_token } })
+      if (opt.json) { io.out(JSON.stringify(s, null, 2) + '\n'); return 0 }
+      const svc = { ...s, project: s.project ?? project }
+      const where = s.type !== 'web' ? '' : s.public === false
+        ? `, internal only${s.internal_url ? ` (other services of the application reach it at ${s.internal_url})` : ''}`
+        : `${s.url ? `, public at ${s.url}` : ''}${s.internal_url ? ` (inside the application: ${s.internal_url})` : ''}`
+      io.out(`Added ${label(svc)} (service ${s.id}): ${TYPE_LABEL[s.type] ?? s.type}${where}.\n`)
+      io.out(kindOf(s.type) === 'app'
+        ? `It is starting; follow it with: rivervo logs ${label(svc)} -f\n`
+        : `It is starting; rivervo services info ${label(svc)} shows its status.\n`)
+      return 0
+    } catch (e) {
+      // The price changed or the quote expired: the API sends a new one; show it and ask again (a terminal).
+      if (e.status !== 422 || e.body?.reason !== 'quote_required' || round >= 2) throw e
+      io.err(`${e.message}\n`)
+      res = e.body
+      if (!tty) {
+        if (!opt.json) io.out(`${priceLine(res.quote ?? {}, project)}\n`)
+        io.err('The price is new: run the command again to add it at this price.\n')
+        return 1
+      }
+    }
+  }
 }
 
 /** Link this directory to a service: .rivervo {project, service} (ids — renaming does not break it). */
@@ -742,8 +952,8 @@ const SHELL_ERRORS = {
 }
 
 /**
- * An interactive shell: a one-time ticket from the API, then a WebSocket straight to the app's own
- * address (the server's terminal gateway). The terminal is raw while it lasts; the exit code is the shell's.
+ * An interactive shell: a one-time ticket from the API, then a WebSocket to the address the API gives with it
+ * (the terminal gateway of the server the service runs on). The terminal is raw while it lasts; the exit code is the shell's.
  * io.WebSocket / io.stdin / io.stdout can be given (tests); Node 22 has WebSocket built in.
  */
 async function cmdShell (ctx) {
@@ -850,6 +1060,7 @@ export async function main (argv = process.argv.slice(2), io = {}) {
     if (!(e instanceof ApiError)) throw e
     if (e.status === 401) io.err('The token is not valid (revoked or expired). Run: rivervo login\n')
     else if (e.status === 403 && e.body?.reason === 'token_scope') io.err(`${e.message}\n(This needs a “${e.body.needs}” token.)\n`)
+    else if (e.status === 403 && e.body?.reason === 'forbidden' && e.body?.needs === 'owner') io.err(`${e.message}\n(Only the account owner can do this.)\n`)
     else if (e.status === 403 && e.body?.reason === 'forbidden' && e.body?.needs === 'admin') io.err(`${e.message}\n(This needs the Administrator role in the application${e.body.role ? `; yours is ${e.body.role}` : ''}.)\n`)
     else if (e.status === 429) io.err(`${e.message}\n`)
     else {

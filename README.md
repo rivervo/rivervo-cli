@@ -19,7 +19,7 @@ Create a token in the panel: **Account settings → API tokens**. Choose what it
 |----------|--------|
 | `read`   | applications, deployments and their logs, runtime logs, domains, usage (if your role sees money) |
 | `deploy` | read + deploy, redeploy, roll back, restart |
-| `full`   | deploy + variables (a service's own and the application's shared ones), domains, a public address on or off and `rivervo shell` |
+| `full`   | deploy + variables (a service's own and the application's shared ones), domains, a public address on or off, adding a service and `rivervo shell` |
 
 The token is shown once. Then:
 
@@ -48,6 +48,7 @@ rivervo apps                              # your applications and their services
 rivervo services info shop/api            # a service: status, public and internal address, repository, resources
 rivervo services set-public shop/api off  # internal only: no public address (asks first; --yes / -y does not)
 rivervo services set-public shop/api on   # a public address again (on|off, true|false, public|internal)
+rivervo services add shop                 # add a service: asks what it is, shows the price, adds it once confirmed
 rivervo link shop/web                     # this directory works with shop/web (saved in .rivervo)
 rivervo deploy shop                       # build the latest commit and follow the deploy
 rivervo deploy shop --no-build            # deploy the running version again (applies changed variables)
@@ -70,9 +71,10 @@ rivervo shell shop --process w1           # … in its first background worker (
 echo 'php artisan about' | rivervo shell shop   # input from a pipe: the shell ends with it
 ```
 
-`rivervo shell` connects straight to the app's own address (`wss://<slug>.rivervo.app`) with a one-time ticket
-from the API; your terminal is raw while it lasts, and the command exits with the shell's exit code. It closes
-after 30 minutes without activity and after 4 hours at most; at most 2 can be open to a service at once.
+`rivervo shell` connects to the server the service runs on, over `wss://`, with a one-time ticket; both the
+address and the ticket come from the API. Your terminal is raw while it lasts, and the command exits with the
+shell's exit code. It closes after 30 minutes without activity and after 4 hours at most; at most 2 can be open
+to a service at once.
 Opening one is noted in the account's activity; what you type is not recorded. Needs a `full` token.
 
 ### Public address or internal only
@@ -89,7 +91,38 @@ until they are removed or turned off, and so is any switch while a deploy is run
 and the Administrator role in the application (or the account owner). `rivervo open` on an internal-only
 service shows its internal address instead of opening a browser.
 
-Services are created in the panel; the API (and so the CLI) does not create them.
+New applications are created in the panel; services are added to one with `rivervo services add`
+(below), as public or internal only.
+
+### Adding a service
+
+`rivervo services add [application]` adds a web service, a background worker, a cron job, or a PostgreSQL,
+MySQL or Valkey (`redis`) database to an existing application. In a terminal it asks for what the flags leave
+out, step by step: the type, the name, for a web service a public address or internal only (no default: one
+has to be chosen), where the code comes from (`project` — the code of one of the application's services, run
+with another command; `repo` — a GitHub repository; `image` — a Docker image), and the resources, with the
+defaults for its kind. **The price comes first**: what the service adds to the application's monthly bill and
+what is charged now (amounts without tax, from the same calculation as the panel's), and the service is added
+only once you confirm it (`[y/N]`, Enter is no). If the price changes before that, the new one is shown and
+asked about again.
+
+Without a terminal give everything as flags and `--yes`; a missing one is named and nothing is added, and
+without `--yes` only the price is printed (exit 1). It needs a `full` token and the Administrator role in the
+application; a service from another repository can be added only by the account owner.
+
+```sh
+rivervo services add shop                 # asked step by step
+rivervo services add shop --type web --name api --internal --source image --image nginx:1.27 --port 80 --yes
+rivervo services add shop --type worker --name jobs --source project --from web --command 'php artisan queue:work' --yes
+rivervo services add shop --type cron --name nightly --command 'php artisan backup' --schedule '0 3 * * *' --yes
+rivervo services add shop --type postgres --name db --memory 2048 --yes
+rivervo services add shop --type web --name site --public --source repo --repo acme/site --branch main \
+  --var APP_ENV=production --yes
+```
+
+`--from` is the service whose code it runs (default: the application's first one); `--registry-user` and
+`--registry-password` reach a private image; `--memory` (MB), `--cpus`, `--disk` (GB) and repeated
+`--var KEY=value` are optional. `--json` prints the added service (or, without `--yes`, the quote).
 
 `[app]` is a service (see above). Leave it out when the directory is linked (`rivervo link`), when you have
 one application with one code service, or set `--app` / `RIVERVO_APP`. `[application]` (for `--shared` and
