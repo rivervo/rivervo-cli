@@ -130,11 +130,11 @@ test('interactive: a web service, internal only, from an image — asked step by
 
 test('interactive: Enter at the confirmation adds nothing', async () => {
   const r = await run(['services', 'add', 'shop', '--type', 'worker', '--name', 'jobs', '--source', 'project', '--command', 'run', '--memory', '256', '--cpus', '1', '--disk', '5'], {
-    answers: ['', ''],
+    answers: ['1', ''],
   })
   assert.equal(r.code, 1)
-  // Whose code: the list, Enter is its first service; then only the confirmation.
-  assert.deepEqual(r.asked, ['Service [1]: ', 'Add the service? [y/N] '])
+  // Whose code: two code services, so the customer chooses (no default, as in the panel); then only the confirmation.
+  assert.deepEqual(r.asked, ['Service [1-2]: ', 'Add the service? [y/N] '])
   assert.match(r.out, /Whose code does it run\?\n {2}1\) web/)
   assert.equal(posts('services/quote')[0].image_from, 7)
   assert.match(r.err, /Nothing added/)
@@ -167,7 +167,10 @@ test('non-interactive: a missing flag is named; --public or --internal is requir
 
   r = await run(['services', 'add', 'shop', '--name', 'api', '--yes'])
   assert.match(r.err, /^Missing --type/)
+  // Two services with code: whose code must be named (no default, as in the panel).
   r = await run(['services', 'add', 'shop', '--type', 'cron', '--name', 'nightly', '--command', 'php artisan x', '--yes'])
+  assert.match(r.err, /^Missing --from \(web, worker\)/)
+  r = await run(['services', 'add', 'shop', '--type', 'cron', '--name', 'nightly', '--from', 'web', '--command', 'php artisan x', '--yes'])
   assert.match(r.err, /^Missing --schedule/)
   r = await run(['services', 'add', 'shop', '--type', 'worker', '--name', 'w', '--yes'])
   assert.match(r.err, /^Missing --source/)

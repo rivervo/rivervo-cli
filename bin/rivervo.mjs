@@ -17,7 +17,7 @@ import { pathToFileURL } from 'node:url'
 import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
 
-export const VERSION = '1.3.0'
+export const VERSION = '1.3.1'
 const DEFAULT_API = 'https://api.rivervo.com/api/v1'
 
 const HELP = `rivervo ${VERSION} — Rivervo Applications from the command line
@@ -624,10 +624,13 @@ async function cmdServiceAdd (ctx) {
           const hit = code.find(s => lc(s.name) === lc(opt.from) || String(s.id) === String(opt.from))
           if (!hit) throw new Missing(`${project.slug} has no code service “${opt.from}”. Its code services: ${code.map(s => s.name).join(', ')}`)
           body.image_from = hit.id
-        } else if (tty) {
-          io.out(`Whose code does it run?\n${listed(code.map(s => `${s.name.padEnd(12)}${s.type ?? 'web'}`))}`)
-          const pick = await value(undefined, '--from', `Service [1]: `, a => byRef(a), { optional: true })
-          body.image_from = (pick ?? code[0]).id
+        } else if (code.length === 1) {
+          // As in the panel (owner, 19.10.2026): the only code service is taken; with more, the customer chooses.
+          body.image_from = code[0].id
+        } else {
+          if (tty) io.out(`Whose code does it run?\n${listed(code.map(s => `${s.name.padEnd(12)}${s.type ?? 'web'}`))}`)
+          const pick = await value(undefined, `--from (${code.map(s => s.name).join(', ')})`, `Service [1-${code.length}]: `, a => byRef(a))
+          body.image_from = pick.id
         }
         body.command = await value(opt.command, '--command', 'Command to run: ', a => a)
       } else if (source === 'repo') {
