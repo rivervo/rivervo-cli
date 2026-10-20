@@ -150,6 +150,31 @@ Variables reach the app with its next deploy: after `env set`/`env rm`, run
 `deploy` and `rollback` exit with 0 when the new version is live and 1 when it did not finish,
 so they can gate a CI job. Add `--json` to any command for the API's JSON.
 
+### Moving files into object storage
+
+Bring files from Amazon S3, Google Cloud Storage or any S3-compatible storage into one of the application's
+buckets (`rivervo storage ls [app]` lists them). Needs a **full** token and the Administrator role.
+
+```sh
+export RIVERVO_IMPORT_ACCESS_KEY_ID=…        # a key that can only list and read the old bucket
+export RIVERVO_IMPORT_SECRET_ACCESS_KEY=…
+rivervo storage import shop media --mode copy --provider s3 --source-bucket old-media --region eu-central-1
+rivervo storage import status shop media --watch      # a progress line until it ends (exit 0 when done)
+rivervo storage import pause|resume|abort shop media
+```
+
+- `--mode copy` copies everything now (it runs on our side; you get an e-mail when it is done); `--mode gradual`
+  copies a file the first time it is read — switch the application to the bucket at once, later run a copy for the
+  rest, then `rivervo storage import stop-gradual shop media`.
+- `--provider gcs`: the service account's JSON key from `--gcs-key-file <path>` or `RIVERVO_IMPORT_GCS_KEY_FILE`.
+  `--provider s3-compatible`: `--endpoint https://…` (without the bucket), `--region` optional.
+- `--prefix photos/` copies one folder; `--overwrite` replaces files of the same name already in the bucket
+  (default: they are kept). Both for `--mode copy` only.
+- Keys are never taken as flags (they would stay in your shell history): without the variables a terminal asks
+  for them with hidden input. The command shows what it will do and asks `[y/N]`; without a terminal pass `--yes`.
+- No fee for the move itself: files cost the usual storage prices, paid from your balance; it is not available
+  during the free trial or into a read-only bucket. Details: https://rivervo.com/help/applications/import-storage
+
 ### Team accounts
 
 If you are a member of someone else's account, add `--account <their customer ID>` (or set
@@ -165,6 +190,8 @@ top of it.
 | `RIVERVO_APP` | the app when none is given (before the directory's link) |
 | `RIVERVO_ACCOUNT` | the account to work in |
 | `RIVERVO_LANG` | language of the API's messages: `en` (default), `az`, `ru` |
+| `RIVERVO_IMPORT_ACCESS_KEY_ID`, `RIVERVO_IMPORT_SECRET_ACCESS_KEY` | `storage import`: the old storage's read-only key |
+| `RIVERVO_IMPORT_GCS_KEY_FILE` | `storage import --provider gcs`: path to the service account's JSON key |
 
 ## The API
 

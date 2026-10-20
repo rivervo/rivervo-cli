@@ -6,6 +6,7 @@
  *
  *   rivervo login | logout | apps | services [ls] | services info | services set-public | services add | link | unlink
  *           | deploy | logs | env ls|set|rm [--shared] | usage | rollback | open | shell
+ *           | storage ls | storage import [status|pause|resume|abort|stop-gradual]
  *
  * Importable for tests: main(argv, io) runs one command and resolves its exit code.
  */
@@ -17,7 +18,7 @@ import { pathToFileURL } from 'node:url'
 import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
 
-export const VERSION = '1.4.0'
+export const VERSION = '1.5.0'
 const DEFAULT_API = 'https://api.rivervo.com/api/v1'
 
 const HELP = `rivervo ${VERSION} — Rivervo Applications from the command line
@@ -49,6 +50,16 @@ Usage
   rivervo open [app]                              open the app in the browser (an internal-only one has no address)
   rivervo shell [app] [--process web|i2|w1]       an interactive shell in the running service (tinker, psql…);
                                                   web is its first instance, i2… the others, w1… a worker
+  rivervo storage ls [app]                        the application's object storage buckets
+  rivervo storage import [app] <bucket> --mode copy|gradual --provider s3|gcs|s3-compatible
+          --source-bucket <name> [--region <r>] [--endpoint <https://…>] [--prefix <folder/>] [--overwrite] [-y]
+                                                  move files into a bucket from another storage: copy everything
+                                                  now, or gradually (copied on first read). Asks for the old
+                                                  storage's key (hidden) or reads it from the environment (below);
+                                                  asks before starting (-y: do not ask). Full token, Administrator
+  rivervo storage import status [app] <bucket> [--watch]
+                                                  the copy's progress and gradual moving; --watch follows the copy
+  rivervo storage import pause|resume|abort|stop-gradual [app] <bucket> [-y]
 
 [app] is a service: application/service (shop/worker), a service's id, its address (slug) or name;
 an application alone (shop) when it has one code service. Without it: --app, the RIVERVO_APP
@@ -74,13 +85,17 @@ Environment
   RIVERVO_TOKEN    a token to use instead of the saved one (CI)
   RIVERVO_API_URL  the API (default ${DEFAULT_API})
   RIVERVO_LANG     language of messages from the API: en (default), az, ru
+  RIVERVO_IMPORT_ACCESS_KEY_ID, RIVERVO_IMPORT_SECRET_ACCESS_KEY   storage import: the old storage's key (S3 and
+                   S3-compatible) — a key that can only list and read that bucket; never pass it as a flag
+  RIVERVO_IMPORT_GCS_KEY_FILE   storage import from Google Cloud Storage: path to the service account's JSON key
 `
 
 // ── arguments ────────────────────────────────────────────────────────────
 
 const FLAGS_WITH_VALUE = new Set(['token', 'api', 'app', 'account', 'lines', 'n', 'process', 'target', 'month',
   'type', 'name', 'source', 'from', 'command', 'repo', 'branch', 'image', 'port', 'schedule', 'memory', 'cpus', 'disk', 'var',
-  'registry-user', 'registry-password'])
+  'registry-user', 'registry-password', 'mode', 'provider', 'source-bucket', 'region', 'endpoint', 'prefix', 'gcs-key-file',
+  'access-key-id', 'secret-access-key'])
 /** Flags that may be given more than once (a list). */
 const FLAGS_REPEATED = new Set(['var'])
 
@@ -1043,7 +1058,222 @@ async function cmdShell (ctx) {
   })
 }
 
-const COMMANDS = { shell: cmdShell, login: cmdLogin, logout: cmdLogout, apps: cmdApps, ls: cmdApps, services: cmdServices, link: cmdLink, unlink: cmdUnlink, deploy: cmdDeploy, rollback: cmdRollback, logs: cmdLogs, env: cmdEnv, usage: cmdUsage, open: cmdOpen }
+// ── storage: buckets and moving files in (the API from 1.4) ───────────────
+
+const IMPORT_ACTIONS = ['status', 'pause', 'resume', 'abort', 'stop-gradual']
+const PROVIDER_FLAG = { s3: 's3', gcs: 'gcs', 's3-compatible': 's3_compatible', s3_compatible: 's3_compatible' }
+const PROVIDER_NAME = { s3: 'Amazon S3', gcs: 'Google Cloud Storage', s3_compatible: 'S3-compatible storage' }
+const IMPORT_STATUS = { starting: 'starting', running: 'copying', paused: 'paused', completed: 'done', aborted: 'stopped', failed: 'failed', on: 'on', off: 'off' }
+const IMPORT_REFUSED = {
+  trial: 'Moving files in is not available during the free trial.',
+  balance_required: 'Moving files in needs a positive balance. Top up in the panel: Billing → Top up.',
+  read_only: 'The bucket is read-only now.',
+  busy: 'One of this kind is already running for this bucket.',
+}
+
+/** A bucket of the application of `app` by its name or id (GET /apps/{id}/storage). */
+export async function resolveBucket (call, appId, ref) {
+  const { data } = await call('GET', `/apps/${appId}/storage`)
+  const list = data ?? []
+  const needle = lc(String(ref ?? '').trim())
+  const hit = list.find(b => String(b.id) === needle || lc(b.name) === needle || lc(b.bucket) === needle)
+  if (hit) return hit
+  const names = list.map(b => b.name).join(', ')
+  throw new ApiError(404, { message: needle ? `No bucket “${ref}” in this application.${names ? ` Its buckets: ${names}.` : ' It has no buckets yet.'}` : `Which bucket?${names ? ` ${names}` : ' The application has no buckets yet.'}` })
+}
+
+/** «copying 26% — 1 000 found · 250 copied · 10 skipped · 0 not copied» */
+export function importLine (i) {
+  if (!i) return ''
+  const st = IMPORT_STATUS[i.status] ?? i.status
+  if (i.mode === 'gradual') return `gradual moving ${st} — from ${PROVIDER_NAME[i.provider] ?? i.provider} ${i.source?.bucket ?? ''}`.trimEnd()
+  const p = i.progress ?? {}
+  const n = v => v === null || v === undefined ? '—' : Number(v).toLocaleString('en-US')
+  const pct = p.percent === null || p.percent === undefined ? '' : ` ${p.percent}%`
+  const held = i.held === 'read_only' ? ' (paused while the bucket is read-only)' : ''
+  return `copy ${st}${pct} — ${n(p.objects)} found · ${n(p.transferred)} copied · ${n(p.skipped)} skipped · ${n(p.failed)} not copied${held}`
+}
+
+async function cmdStorage (ctx) {
+  const { pos, io } = ctx
+  const sub = pos[0]
+  if (sub === 'ls' || sub === 'list' || sub === undefined) return cmdStorageLs({ ...ctx, pos: pos.slice(1) })
+  if (sub === 'import') return cmdStorageImport({ ...ctx, pos: pos.slice(1) })
+  io.err('Usage: rivervo storage ls [app] | storage import [status|pause|resume|abort|stop-gradual] [app] <bucket> …\n')
+  return 1
+}
+
+async function cmdStorageLs (ctx) {
+  const { call, pos, io, opt } = ctx
+  const app = await resolveApp(call, pos[0] ?? ctx.appRef, ctx)
+  const res = await call('GET', `/apps/${app.id}/storage`)
+  if (opt.json) { io.out(JSON.stringify(res, null, 2) + '\n'); return 0 }
+  const rows = (res.data ?? []).map(b => [b.name, b.id, b.status, b.size_bytes === null || b.size_bytes === undefined ? '' : `${+(b.size_bytes / 1073741824).toFixed(2)} GB`, b.read_only ? 'read-only' : ''])
+  if (!rows.length) { io.out(`${app.project?.slug ?? label(app)} has no buckets yet. Add one in the panel: the application → Storage.\n`); return 0 }
+  io.out(table([['BUCKET', 'ID', 'STATUS', 'SIZE', ''], ...rows]))
+  return 0
+}
+
+/** [app ref, bucket ref] from «[app] <bucket>». */
+function appAndBucket (ctx, pos) {
+  if (pos.length === 2) return [pos[0], pos[1]]
+  if (pos.length === 1) return [ctx.appRef, pos[0]]
+  return null
+}
+
+async function cmdStorageImport (ctx) {
+  const { pos, io } = ctx
+  const usage = 'Usage: rivervo storage import [app] <bucket> --mode copy|gradual --provider s3|gcs|s3-compatible --source-bucket <name> …\n' +
+    '       rivervo storage import status|pause|resume|abort|stop-gradual [app] <bucket>\n'
+  const action = IMPORT_ACTIONS.includes(pos[0]) ? pos[0] : null
+  const refs = appAndBucket(ctx, action ? pos.slice(1) : pos)
+  if (!refs) { io.err(usage); return 1 }
+  if (action === 'status') return importStatus(ctx, refs)
+  if (action) return importControl(ctx, refs, action)
+  return importStart(ctx, refs)
+}
+
+async function importTarget (ctx, [appRef, bucketRef]) {
+  const app = await resolveApp(ctx.call, appRef, ctx)
+  const bucket = await resolveBucket(ctx.call, app.id, bucketRef)
+  return { app, bucket, base: `/apps/${app.id}/storage/${bucket.id}/import` }
+}
+
+async function importStatus (ctx, refs) {
+  const { call, io, opt, env } = ctx
+  const { bucket, base } = await importTarget(ctx, refs)
+  const every = Number(env.RIVERVO_POLL_MS ?? 5000)
+  let last = ''
+  for (;;) {
+    const res = await call('GET', base)
+    const { copy, gradual } = res.data ?? {}
+    if (opt.json && !opt.watch) { io.out(JSON.stringify(res, null, 2) + '\n'); return 0 }
+    if (!opt.watch) {
+      if (!copy && !gradual) io.out(`Nothing has been moved into ${bucket.name} yet.\n`)
+      if (copy) io.out(importLine(copy) + '\n')
+      if (gradual) io.out(importLine(gradual) + '\n')
+      if (res.refusal) io.out(`A new one cannot start now: ${res.refusal.message}\n`)
+      return 0
+    }
+    if (!copy) { io.err(`There is no copy into ${bucket.name} to follow.\n`); return 1 }
+    const line = importLine(copy)
+    if (line !== last) { io.out(line + '\n'); last = line }
+    if (!['running', 'paused', 'starting'].includes(copy.status)) {
+      if (opt.json) io.out(JSON.stringify(copy, null, 2) + '\n')
+      return copy.status === 'completed' ? 0 : 1
+    }
+    await sleep(every)
+  }
+}
+
+async function importControl (ctx, refs, action) {
+  const { call, io, opt } = ctx
+  const { bucket, base } = await importTarget(ctx, refs)
+  const { data } = await call('GET', base)
+  const it = action === 'stop-gradual' ? data?.gradual : data?.copy
+  if (!it) { io.err(action === 'stop-gradual' ? `Gradual moving was never turned on for ${bucket.name}.\n` : `There is no copy into ${bucket.name}.\n`); return 1 }
+  if ((action === 'abort' || action === 'stop-gradual') && !opt.yes) {
+    const q = action === 'abort'
+      ? `Stop the copy into ${bucket.name}? Files already copied stay. [y/N] `
+      : `Turn off gradual moving into ${bucket.name}? Files that were never read are no longer fetched from the old storage. [y/N] `
+    if (!isTerminal(io)) { io.err(`${q.replace(' [y/N] ', '')}\nPass --yes to do it without a question.\n`); return 1 }
+    if (!/^y(es)?$/i.test((await ask(io, q)).trim())) { io.err('Nothing changed.\n'); return 1 }
+  }
+  let res
+  try {
+    res = await call('POST', `${base}/${it.id}/${action === 'stop-gradual' ? 'stop' : action}`)
+  } catch (e) {
+    if (e.status !== 422 || !e.body?.reason) throw e
+    io.err(`${e.body.message || IMPORT_REFUSED[e.body.reason] || e.message}\n`)
+    return 1
+  }
+  if (opt.json) { io.out(JSON.stringify(res, null, 2) + '\n'); return 0 }
+  io.out(importLine(res.data) + '\n')
+  return 0
+}
+
+/**
+ * Start one. The old storage's key: RIVERVO_IMPORT_ACCESS_KEY_ID / RIVERVO_IMPORT_SECRET_ACCESS_KEY (S3, S3-compatible)
+ * or RIVERVO_IMPORT_GCS_KEY_FILE / --gcs-key-file (a path), else asked (hidden) in a terminal. Never a flag: a key given
+ * as --access-key-id / --secret-access-key is refused, so it does not stay in the shell's history.
+ */
+async function importStart (ctx, refs) {
+  const { call, io, opt, env } = ctx
+  if (opt['access-key-id'] !== undefined || opt['secret-access-key'] !== undefined) {
+    io.err('Keys are not taken as flags (they would stay in your shell history). Set RIVERVO_IMPORT_ACCESS_KEY_ID and\nRIVERVO_IMPORT_SECRET_ACCESS_KEY, or leave them out to be asked.\n')
+    return 1
+  }
+  const tty = isTerminal(io)
+  const need = async (value, question, check, what) => {
+    if (value !== undefined && value !== true && String(value).trim() !== '') return String(value).trim()
+    if (!tty) throw new ApiError(400, { message: `Give ${what}.` })
+    const v = (await ask(io, question)).trim()
+    if (!v || (check && !check(v))) throw new ApiError(400, { message: `Not ${what}: ${v || '(empty)'}` })
+    return v
+  }
+  const mode = lc(await need(opt.mode, 'copy (everything now) or gradual (copied on first read)? ', v => ['copy', 'gradual'].includes(lc(v)), '--mode copy|gradual'))
+  if (!['copy', 'gradual'].includes(mode)) { io.err('--mode is copy or gradual.\n'); return 1 }
+  const provider = PROVIDER_FLAG[lc(await need(opt.provider, 'Old storage — s3, gcs or s3-compatible? ', v => !!PROVIDER_FLAG[lc(v)], '--provider s3|gcs|s3-compatible'))]
+  if (!provider) { io.err('--provider is s3, gcs or s3-compatible.\n'); return 1 }
+  const body = { mode, provider, bucket: await need(opt['source-bucket'], 'The bucket in the old storage: ', null, '--source-bucket <name>') }
+  if (provider === 's3') body.region = await need(opt.region, 'Its region (e.g. eu-central-1): ', null, '--region <region>')
+  if (provider === 's3_compatible') {
+    body.endpoint = await need(opt.endpoint, 'Its S3 address (https://…, without the bucket): ', v => /^https:\/\//.test(v), '--endpoint https://…')
+    if (opt.region && opt.region !== true) body.region = String(opt.region)
+  }
+  if (mode === 'copy') {
+    if (opt.prefix && opt.prefix !== true) body.prefix = String(opt.prefix)
+    body.overwrite = opt.overwrite === true
+  } else if (opt.prefix || opt.overwrite) { io.err('--prefix and --overwrite are for --mode copy only.\n'); return 1 }
+
+  const { app, bucket, base } = await importTarget(ctx, refs)
+  if (provider === 'gcs') {
+    const file = opt['gcs-key-file'] && opt['gcs-key-file'] !== true ? String(opt['gcs-key-file']) : env.RIVERVO_IMPORT_GCS_KEY_FILE || (tty ? (await ask(io, 'Path to the service account\'s JSON key file: ')).trim() : '')
+    if (!file) { io.err('Give the service account\'s JSON key file: --gcs-key-file <path> or RIVERVO_IMPORT_GCS_KEY_FILE.\n'); return 1 }
+    try {
+      body.service_account_json = await readFile(file, 'utf8')
+    } catch (e) {
+      io.err(`Cannot read ${file}: ${e.message}\n`)
+      return 1
+    }
+  } else {
+    body.access_key_id = env.RIVERVO_IMPORT_ACCESS_KEY_ID || (tty ? (await ask(io, 'Access key ID (a key that can only list and read that bucket): ', { hidden: true })).trim() : '')
+    body.secret_access_key = env.RIVERVO_IMPORT_SECRET_ACCESS_KEY || (tty ? (await ask(io, 'Secret access key: ', { hidden: true })).trim() : '')
+    if (!body.access_key_id || !body.secret_access_key) {
+      io.err('Give the old storage\'s key: set RIVERVO_IMPORT_ACCESS_KEY_ID and RIVERVO_IMPORT_SECRET_ACCESS_KEY (or run it in a terminal to be asked).\n')
+      return 1
+    }
+  }
+
+  const from = `${PROVIDER_NAME[provider]} ${body.bucket}${body.prefix ? `/${body.prefix.replace(/^\/+/, '')}` : ''}`
+  const what = mode === 'copy'
+    ? `Copy everything from ${from} into ${bucket.name} of ${app.project?.slug ?? label(app)}${body.overwrite ? ', replacing files of the same name' : ' (files already there are kept)'}.`
+    : `Turn on gradual moving from ${from} into ${bucket.name} of ${app.project?.slug ?? label(app)}: a file is copied the first time it is read.`
+  const cost = 'No fee for the move itself: files cost the usual storage prices (size and writes), paid from your balance; your old provider may charge for data leaving it.'
+  if (!opt.yes) {
+    if (!tty) { io.err(`${what}\n${cost}\nPass --yes to start it without a question.\n`); return 1 }
+    io.out(`${what}\n${cost}\n`)
+    if (!/^y(es)?$/i.test((await ask(io, 'Start? [y/N] ')).trim())) { io.err('Nothing started.\n'); return 1 }
+  }
+  let res
+  try {
+    res = await call('POST', base, { body })
+  } catch (e) {
+    if (e.status !== 422 || !e.body?.reason) throw e
+    io.err(`${e.body.message || IMPORT_REFUSED[e.body.reason] || e.message}\n`)
+    return 1
+  } finally {
+    delete body.access_key_id
+    delete body.secret_access_key
+    delete body.service_account_json
+  }
+  if (opt.json) { io.out(JSON.stringify(res, null, 2) + '\n'); return 0 }
+  if (mode === 'copy') io.out(`The copy has started; it runs on our side and you get an e-mail when it is done.\nFollow it: rivervo storage import status ${app.project?.slug ?? label(app)} ${bucket.name} --watch\n`)
+  else io.out(`Gradual moving is on. Switch your application to ${bucket.name} now (its S3_* variables).\nTo finish: run a copy for the rest (--mode copy), then: rivervo storage import stop-gradual ${app.project?.slug ?? label(app)} ${bucket.name}\n`)
+  return 0
+}
+
+const COMMANDS = { shell: cmdShell, login: cmdLogin, logout: cmdLogout, apps: cmdApps, ls: cmdApps, services: cmdServices, link: cmdLink, unlink: cmdUnlink, deploy: cmdDeploy, rollback: cmdRollback, logs: cmdLogs, env: cmdEnv, usage: cmdUsage, open: cmdOpen, storage: cmdStorage }
 
 /** Run one command. @returns {Promise<number>} the exit code */
 export async function main (argv = process.argv.slice(2), io = {}) {
