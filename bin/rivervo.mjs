@@ -18,10 +18,10 @@ import { pathToFileURL } from 'node:url'
 import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
 
-export const VERSION = '1.5.0'
+export const VERSION = '1.6.0'
 const DEFAULT_API = 'https://api.rivervo.com/api/v1'
 
-const HELP = `rivervo ${VERSION} — Rivervo Applications from the command line
+const HELP = `rivervo ${VERSION} — Rivervo Applications and websites from the command line
 
 Usage
   rivervo login [--token <token>] [--api <url>]   save a personal API token
@@ -61,6 +61,22 @@ Usage
                                                   the copy's progress and gradual moving; --watch follows the copy
   rivervo storage import pause|resume|abort|stop-gradual [app] <bucket> [-y]
 
+
+Websites (hosting)
+  rivervo sites                                   your websites: id, domain, plan, status
+  rivervo run <site> [--cwd <folder>] [--timeout <s>] -- <command…>
+                                                  run a command on the website as its account (npm, composer,
+                                                  wp-cli, php, git…); exits with the command's code.
+                                                  Needs a «terminal» token
+  rivervo dns ls <site> [domain]                  the domain's DNS records (default: the website's domain)
+  rivervo dns add <site> <domain> <TYPE> <name> <value…> [--ttl <s>]
+                                                  add a record, e.g. dns add shop.az shop.az TXT @ "v=spf1 …";
+                                                  MX: dns add shop.az shop.az MX @ 10 mail.example.com.
+  rivervo db ls <site>                            MySQL databases and their users
+  rivervo db create <site> <name>                 a new database (the account's prefix is added)
+  rivervo api <METHOD> <path> [--data '<json>']   any operation of the API, e.g. api GET /hosting/12/cron
+                                                  (all of them: https://api.rivervo.com/reference)
+  <site> is a website's domain or id.
 [app] is a service: application/service (shop/worker), a service's id, its address (slug) or name;
 an application alone (shop) when it has one code service. Without it: --app, the RIVERVO_APP
 variable, the directory's link (rivervo link), or your only application's only service.
@@ -95,7 +111,7 @@ Environment
 const FLAGS_WITH_VALUE = new Set(['token', 'api', 'app', 'account', 'lines', 'n', 'process', 'target', 'month',
   'type', 'name', 'source', 'from', 'command', 'repo', 'branch', 'image', 'port', 'schedule', 'memory', 'cpus', 'disk', 'var',
   'registry-user', 'registry-password', 'mode', 'provider', 'source-bucket', 'region', 'endpoint', 'prefix', 'gcs-key-file',
-  'access-key-id', 'secret-access-key'])
+  'access-key-id', 'secret-access-key', 'cwd', 'timeout', 'ttl', 'data'])
 /** Flags that may be given more than once (a list). */
 const FLAGS_REPEATED = new Set(['var'])
 
@@ -1273,7 +1289,113 @@ async function importStart (ctx, refs) {
   return 0
 }
 
-const COMMANDS = { shell: cmdShell, login: cmdLogin, logout: cmdLogout, apps: cmdApps, ls: cmdApps, services: cmdServices, link: cmdLink, unlink: cmdUnlink, deploy: cmdDeploy, rollback: cmdRollback, logs: cmdLogs, env: cmdEnv, usage: cmdUsage, open: cmdOpen, storage: cmdStorage }
+// ── websites (hosting), 30.10.2026: the owner's «everything the panel does» from the command line ──────────────
+
+/** The website a reference names: its id or its domain (from GET /hosting/list). */
+async function siteOf (ctx, ref) {
+  if (!ref) throw new ApiError(0, { message: 'Name the website: its domain or id (rivervo sites lists them).' })
+  const res = await ctx.call('GET', '/hosting/list')
+  const list = res.data ?? res
+  const want = String(ref).toLowerCase().replace(/^www\./, '')
+  const hit = list.find(h => String(h.id) === want || String(h.domain ?? '').toLowerCase() === want)
+  if (!hit) throw new ApiError(0, { message: `No website «${ref}» in this account. rivervo sites lists them.` })
+  return hit
+}
+
+async function cmdSites ({ call, io, opt }) {
+  const res = await call('GET', '/hosting/list')
+  const list = res.data ?? res
+  if (opt.json) { io.out(JSON.stringify(list, null, 2) + '\n'); return 0 }
+  if (!list.length) { io.out('No websites yet. Create one in the panel.\n'); return 0 }
+  const rows = [['ID', 'DOMAIN', 'PLAN', 'STATUS', 'PAID UNTIL']]
+  for (const h of list) {
+    const status = h.suspended ? 'suspended' : h.is_pending ? 'being set up' : h.is_expired ? 'expired' : 'active'
+    rows.push([h.id, h.domain ?? '', h.package?.name ?? '', status, h.end_date ?? ''])
+  }
+  io.out(table(rows))
+  return 0
+}
+
+/** rivervo run <site> [--cwd <folder>] [--timeout <s>] -- <command…>: one command as the website's account. */
+async function cmdRun (ctx) {
+  const { pos, opt, io } = ctx
+  const site = await siteOf(ctx, pos.shift())
+  const command = pos.join(' ').trim()
+  if (!command) { io.err('Usage: rivervo run <site> -- <command>\n'); return 1 }
+  const res = await ctx.call('POST', `/hosting/${site.id}/access/exec`, { body: { command, ...(opt.cwd ? { cwd: opt.cwd } : {}), ...(opt.timeout ? { timeout: Number(opt.timeout) } : {}) } })
+  const r = res.data ?? res
+  if (opt.json) { io.out(JSON.stringify(r, null, 2) + '\n'); return r.exit === 0 ? 0 : 1 }
+  io.out(r.output ?? '')
+  if (r.timed_out) io.err(`(stopped after ${opt.timeout ?? 60} s)\n`)
+  return r.exit === 0 ? 0 : (r.exit || 1)
+}
+
+/** rivervo dns ls <site> <domain> | dns add <site> <domain> <TYPE> <name> <value…> [--ttl <s>] */
+async function cmdDns (ctx) {
+  const { pos, opt, io } = ctx
+  const sub = pos.shift()
+  const site = await siteOf(ctx, pos.shift())
+  const zone = pos.shift() ?? site.domain
+  const read = async () => (await ctx.call('GET', `/hosting/${site.id}/access/dns/records`, { query: { zone } })).data
+  if (sub === 'ls') {
+    const z = await read()
+    if (opt.json) { io.out(JSON.stringify(z, null, 2) + '\n'); return 0 }
+    io.out(table([['TYPE', 'NAME', 'TTL', 'VALUE'], ...(z.records ?? []).filter(r => !r.locked).map(r => [r.type, r.name, r.ttl, (r.data ?? []).join(' ')])]))
+    return 0
+  }
+  if (sub === 'add') {
+    const [type, name, ...data] = pos
+    if (!type || !name || !data.length) { io.err('Usage: rivervo dns add <site> <domain> <TYPE> <name> <value…>   e.g. dns add shop.az shop.az TXT @ "v=spf1 …"\n'); return 1 }
+    const z = await read()
+    await ctx.call('PUT', `/hosting/${site.id}/access/dns/records`, { body: { zone, serial: String(z.serial ?? ''), add: [{ type: type.toUpperCase(), name, data, ...(opt.ttl ? { ttl: Number(opt.ttl) } : {}) }], edit: [], remove: [] } })
+    io.out(`Added: ${type.toUpperCase()} ${name} ${data.join(' ')}\n`)
+    return 0
+  }
+  io.err('Usage: rivervo dns ls|add <site> [domain] …\n')
+  return 1
+}
+
+/** rivervo db ls <site> | db create <site> <name> */
+async function cmdDb (ctx) {
+  const { pos, opt, io } = ctx
+  const sub = pos.shift()
+  const site = await siteOf(ctx, pos.shift())
+  if (sub === 'ls') {
+    const d = (await ctx.call('GET', `/hosting/${site.id}/databases`)).data
+    if (opt.json) { io.out(JSON.stringify(d, null, 2) + '\n'); return 0 }
+    const dbs = d.databases ?? []
+    io.out(table([['DATABASE', 'SIZE (MB)', 'USERS'], ...dbs.map(x => [x.name, Math.round((x.size ?? 0) / 1048576), (x.users ?? []).join(', ')])]))
+    return 0
+  }
+  if (sub === 'create') {
+    const name = pos.shift()
+    if (!name) { io.err('Usage: rivervo db create <site> <name>\n'); return 1 }
+    const r = (await ctx.call('POST', `/hosting/${site.id}/databases`, { body: { name } })).data
+    io.out(`Created: ${r.database ?? name}\n`)
+    return 0
+  }
+  io.err('Usage: rivervo db ls|create <site> …\n')
+  return 1
+}
+
+/** rivervo api <METHOD> <path> [--data '<json>'] — any operation of the API (https://api.rivervo.com/reference). */
+async function cmdApi (ctx) {
+  const { pos, opt, io } = ctx
+  const method = String(pos.shift() ?? '').toUpperCase()
+  const path = pos.shift()
+  if (!/^(GET|POST|PUT|PATCH|DELETE)$/.test(method) || !path) { io.err('Usage: rivervo api <GET|POST|PUT|PATCH|DELETE> <path> [--data \'{"key":"value"}\']\n'); return 1 }
+  let body
+  if (opt.data !== undefined) {
+    try { body = JSON.parse(opt.data) } catch { io.err('--data must be JSON\n'); return 1 }
+  }
+  const [p, q] = path.split('?')
+  const query = Object.fromEntries(new URLSearchParams(q ?? ''))
+  const res = await ctx.call(method, '/' + p.replace(/^\/+/, '').replace(/^api\/v1\//, ''), { body, query })
+  io.out(JSON.stringify(res, null, 2) + '\n')
+  return 0
+}
+
+const COMMANDS = { shell: cmdShell, login: cmdLogin, logout: cmdLogout, apps: cmdApps, ls: cmdApps, services: cmdServices, link: cmdLink, unlink: cmdUnlink, deploy: cmdDeploy, rollback: cmdRollback, logs: cmdLogs, env: cmdEnv, usage: cmdUsage, open: cmdOpen, storage: cmdStorage, sites: cmdSites, run: cmdRun, dns: cmdDns, db: cmdDb, api: cmdApi }
 
 /** Run one command. @returns {Promise<number>} the exit code */
 export async function main (argv = process.argv.slice(2), io = {}) {

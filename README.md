@@ -1,7 +1,8 @@
 # rivervo
 
-Rivervo Applications from the command line: deploy, follow a build, read logs, manage
-variables, roll back, open a shell in a running service. One file, no dependencies, Node.js 22 or newer.
+Rivervo Applications and websites from the command line: deploy, follow a build, read logs, manage
+variables, roll back, open a shell in a running service; run commands on a website, its DNS records and
+databases, and any other operation of the API. One file, no dependencies, Node.js 22 or newer.
 
 ## Install
 
@@ -193,10 +194,27 @@ top of it.
 | `RIVERVO_IMPORT_ACCESS_KEY_ID`, `RIVERVO_IMPORT_SECRET_ACCESS_KEY` | `storage import`: the old storage's read-only key |
 | `RIVERVO_IMPORT_GCS_KEY_FILE` | `storage import --provider gcs`: path to the service account's JSON key |
 
+## Websites (hosting)
+
+```sh
+rivervo sites                                        # id, domain, plan, status
+rivervo run shop.az --cwd public_html -- wp plugin update --all   # a «terminal» token
+rivervo dns ls shop.az
+rivervo dns add shop.az shop.az TXT @ "google-site-verification=abc"
+rivervo dns add shop.az shop.az MX @ 10 mail.example.com.
+rivervo db ls shop.az
+rivervo db create shop.az blog                       # the account's prefix is added: shop_blog
+rivervo api GET /hosting/12/cron                     # any operation, JSON out
+rivervo api POST /hosting/12/cron --data '{"schedule":"*/5 * * * *","command":"php artisan schedule:run","version":"1"}'
+```
+
+`<site>` is a website's domain or id. `run` exits with the command's own code, so it works in scripts and
+CI. Every operation is in the [API reference](https://api.rivervo.com/reference).
+
 ## The API
 
-The CLI uses the public API, documented in OpenAPI 3.1 at
-`https://api.rivervo.com/api/v1/openapi.json`. Against an API from before applications (no
+The CLI uses the public API, documented at https://api.rivervo.com/reference (OpenAPI 3.1:
+`https://api.rivervo.com/api/v1/openapi.json`). Against an API from before applications (no
 `/apps/projects`), `rivervo apps` shows the older list of apps and their services. Limits: 120 requests a minute per person, of them
 30 changes (the server answers 429 with `Retry-After` past them).
 
